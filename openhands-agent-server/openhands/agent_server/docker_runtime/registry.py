@@ -14,6 +14,8 @@ from urllib.error import URLError
 from urllib.request import urlopen
 from uuid import UUID, uuid4
 
+import httpx
+
 from openhands.agent_server.config import V1_SESSION_API_KEY_ENV, Config
 from openhands.agent_server.conversation_registry import ConversationRegistry
 from openhands.agent_server.docker_runtime.provisioning import RuntimeProvisioningStore
@@ -74,6 +76,7 @@ class DockerConversationRegistry(ConversationRegistry):
         self._starts: dict[UUID, asyncio.Task[ConversationContainer]] = {}
         self._deleting: set[UUID] = set()
         self._lock = asyncio.Lock()
+        self._suspend_task: asyncio.Task[None] | None = None
 
     def configure_service(self, service: ConversationService) -> None:
         service.runtime_cipher_resolver = self.resolve_persisted_cipher
@@ -112,6 +115,11 @@ class DockerConversationRegistry(ConversationRegistry):
 
     async def start(self) -> None:
         await asyncio.to_thread(self.cleanup_stale_containers)
+        ttl = self.config.conversation_idle_ttl_seconds
+        if ttl and ttl > 0:
+            self._suspend_task = asyncio.create_task(
+                self._suspend_idle_containers_loop(ttl)
+            )
 
     def add_execution_routes(self, router: APIRouter) -> None:
         from openhands.agent_server.docker_runtime.routers import (
@@ -244,8 +252,122 @@ class DockerConversationRegistry(ConversationRegistry):
             await asyncio.to_thread(container.stop)
 
     async def shutdown(self) -> None:
+        if self._suspend_task is not None:
+            self._suspend_task.cancel()
+            try:
+                await self._suspend_task
+            except asyncio.CancelledError:
+                pass
+            self._suspend_task = None
         ids = set(self._containers) | set(self._starts)
         await asyncio.gather(*(self.stop(cid) for cid in ids), return_exceptions=True)
+
+    # ------------------------------------------------------------------
+    # Idle container suspension
+    # ------------------------------------------------------------------
+
+    async def _suspend_idle_containers_loop(self, ttl: float) -> None:
+        """Periodically stop containers for idle terminal conversations.
+
+        A conversation is suspendable when:
+        1. Its execution status is terminal (FINISHED, ERROR, STUCK).
+        2. It has no external WebSocket subscribers.
+        3. It has no in-flight agent run.
+
+        Suspended containers are recreated transparently by
+        ``get_or_create()`` on the next request.
+        """
+        interval = max(60.0, ttl / 2)
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await self._suspend_idle_containers()
+                except Exception:
+                    logger.exception("error_suspending_idle_containers")
+        except asyncio.CancelledError:
+            raise
+
+    async def _suspend_idle_containers(self) -> None:
+        """Check running containers and stop those that are idle and terminal."""
+        async with self._lock:
+            candidates = list(self._containers.items())
+
+        for conversation_id, container in candidates:
+            if conversation_id in self._deleting:
+                continue
+            try:
+                suspendable = await self._is_suspendable(container)
+            except Exception:
+                logger.debug(
+                    "Could not check suspend status for %s",
+                    conversation_id,
+                    exc_info=True,
+                )
+                continue
+            if not suspendable:
+                continue
+            try:
+                await self.stop(conversation_id)
+                logger.info(
+                    "Suspended idle container for conversation %s",
+                    conversation_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to suspend container for %s",
+                    conversation_id,
+                    exc_info=True,
+                )
+
+    async def _is_suspendable(self, container: ConversationContainer) -> bool:
+        """Query the inner agent-server to decide if the container is idle.
+
+        Returns ``True`` when the inner conversation is in a terminal
+        execution state (finished / error / stuck) **and** reports no
+        external WebSocket subscribers.
+        """
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
+            ) as client:
+                resp = await client.get(
+                    f"{container.host}/api/suspend-check",
+                    headers={"X-Session-API-Key": container.api_key},
+                )
+                if resp.status_code == 404:
+                    # Inner server doesn't have suspend-check endpoint yet;
+                    # fall back to checking conversation list.
+                    return await self._is_suspendable_fallback(client, container)
+                if resp.is_error:
+                    return False
+                data = resp.json()
+                return bool(data.get("suspendable", False))
+        except (httpx.HTTPError, Exception):
+            return False
+
+    async def _is_suspendable_fallback(
+        self, client: httpx.AsyncClient, container: ConversationContainer
+    ) -> bool:
+        """Fallback: check conversations list for terminal state."""
+        try:
+            resp = await client.get(
+                f"{container.host}/api/conversations",
+                headers={"X-Session-API-Key": container.api_key},
+            )
+            if resp.is_error:
+                return False
+            data = resp.json()
+            items = data.get("items", [data]) if isinstance(data, dict) else data
+            if not items:
+                return False
+            for item in items:
+                status = item.get("execution_status", "idle")
+                if status in ("finished", "error", "stuck"):
+                    return True
+            return False
+        except Exception:
+            return False
 
     def _build_container(self, conversation_id: UUID) -> ConversationContainer:
         identity = self.provisioning.load(conversation_id)
