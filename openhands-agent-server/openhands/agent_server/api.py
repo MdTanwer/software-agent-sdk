@@ -34,6 +34,7 @@ from openhands.agent_server.conversation_router import (
     conversation_router,
 )
 from openhands.agent_server.conversation_service import (
+    ConversationService,
     CredentialBindingActivationRequired,
     get_default_conversation_service,
 )
@@ -43,6 +44,7 @@ from openhands.agent_server.credential_binding import (
 from openhands.agent_server.dependencies import (
     check_session_api_key,
     check_workspace_session,
+    get_conversation_service,
 )
 from openhands.agent_server.file_router import file_discovery_router, file_router
 from openhands.agent_server.git_router import git_router
@@ -55,6 +57,7 @@ from openhands.agent_server.init_router import (
 from openhands.agent_server.llm_router import llm_router
 from openhands.agent_server.mcp_router import mcp_router
 from openhands.agent_server.middleware import CORSDispatcher
+from openhands.agent_server.models import ConversationSuspendStatus
 from openhands.agent_server.openai.router import (
     check_openai_api_key,
     openai_router,
@@ -429,6 +432,42 @@ def _add_api_routes(app: FastAPI) -> None:
     api_router.include_router(conversation_catalog_router)
     conversation_registry.add_execution_routes(api_router)
     api_router.include_router(conversation_router)
+
+    @api_router.get("/suspend-check", response_model=ConversationSuspendStatus)
+    async def root_suspend_check(
+        conversation_id: uuid.UUID | None = None,
+        conversation_service: ConversationService = Depends(get_conversation_service),
+    ) -> ConversationSuspendStatus:
+        """Check if the runtime is idle and eligible for suspension."""
+        if conversation_id is not None:
+            conv = await conversation_service.get_conversation(conversation_id)
+            if conv is None or not conv.execution_status.is_terminal():
+                return ConversationSuspendStatus(suspendable=False)
+            event_services = conversation_service._event_services
+            if event_services is not None:
+                es = event_services.get(conversation_id)
+                if es is not None and not es.is_idle_evictable():
+                    return ConversationSuspendStatus(suspendable=False)
+            return ConversationSuspendStatus(suspendable=True)
+
+        event_services = conversation_service._event_services
+        if event_services is not None and event_services:
+            for cid, es in event_services.items():
+                conv = await conversation_service.get_conversation(cid)
+                if conv is None or not conv.execution_status.is_terminal():
+                    return ConversationSuspendStatus(suspendable=False)
+                if not es.is_idle_evictable():
+                    return ConversationSuspendStatus(suspendable=False)
+            return ConversationSuspendStatus(suspendable=True)
+
+        page = await conversation_service.search_conversations(limit=10)
+        if not page.items:
+            return ConversationSuspendStatus(suspendable=False)
+        for item in page.items:
+            if not item.execution_status.is_terminal():
+                return ConversationSuspendStatus(suspendable=False)
+        return ConversationSuspendStatus(suspendable=True)
+
     api_router.include_router(credential_binding_router)
     api_router.include_router(tool_router)
     api_router.include_router(bash_router)

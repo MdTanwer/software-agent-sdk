@@ -30,6 +30,7 @@ from openhands.agent_server.docker_runtime.registry import (
 from openhands.agent_server.models import (
     ConversationRuntimeInfo,
     ConversationRuntimeStatus,
+    ConversationSuspendStatus,
     UpdateSecretsRequest,
 )
 from openhands.agent_server.utils import safe_rmtree
@@ -155,6 +156,22 @@ async def runtime_info(
     if not registry.conversation_dir(conversation_id).joinpath("meta.json").is_file():
         raise HTTPException(404, "Conversation not found")
     return registry.runtime_info(conversation_id)
+
+
+@docker_conversation_router.get(
+    "/{conversation_id}/suspend-check", response_model=ConversationSuspendStatus
+)
+async def docker_suspend_check(
+    conversation_id: UUID, request: Request
+) -> ConversationSuspendStatus:
+    registry = get_registry(request)
+    if not registry.conversation_dir(conversation_id).joinpath("meta.json").is_file():
+        raise HTTPException(404, "Conversation not found")
+    container = registry.get(conversation_id)
+    if container is None:
+        return ConversationSuspendStatus(suspendable=True)
+    is_suspendable = await registry._is_suspendable(conversation_id, container)
+    return ConversationSuspendStatus(suspendable=is_suspendable)
 
 
 @docker_conversation_router.post("/{conversation_id}/runtime/credentials")

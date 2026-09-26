@@ -42,77 +42,45 @@ def _container(conversation_id: UUID) -> ConversationContainer:
 
 @pytest.mark.asyncio
 async def test_suspendable_when_terminal_status(tmp_path, monkeypatch):
-    """Container is suspendable when inner server reports terminal status."""
-    reg = _registry(tmp_path, monkeypatch)
-    cid = uuid4()
-    cont = _container(cid)
-
-    for status in ("finished", "error", "stuck"):
-        mock_response = MagicMock()
-        mock_response.status_code = 404  # suspend-check not found → fallback
-
-        mock_fallback_response = MagicMock()
-        mock_fallback_response.is_error = False
-        mock_fallback_response.json.return_value = {
-            "items": [{"execution_status": status}]
-        }
-
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(side_effect=[mock_response, mock_fallback_response])
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            result = await reg._is_suspendable(cont)
-        assert result is True, f"Expected suspendable for status={status}"
-
-
-@pytest.mark.asyncio
-async def test_not_suspendable_when_running(tmp_path, monkeypatch):
-    """Container is NOT suspendable when conversation is still running."""
+    """Container is suspendable when inner server reports suspendable=True."""
     reg = _registry(tmp_path, monkeypatch)
     cid = uuid4()
     cont = _container(cid)
 
     mock_response = MagicMock()
-    mock_response.status_code = 404
-
-    mock_fallback_response = MagicMock()
-    mock_fallback_response.is_error = False
-    mock_fallback_response.json.return_value = {
-        "items": [{"execution_status": "running"}]
-    }
+    mock_response.status_code = 200
+    mock_response.is_error = False
+    mock_response.json.return_value = {"suspendable": True}
 
     mock_client = AsyncMock()
-    mock_client.get = AsyncMock(side_effect=[mock_response, mock_fallback_response])
+    mock_client.get = AsyncMock(return_value=mock_response)
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
-        result = await reg._is_suspendable(cont)
-    assert result is False
+        result = await reg._is_suspendable(cid, cont)
+    assert result is True
 
 
 @pytest.mark.asyncio
-async def test_not_suspendable_when_idle(tmp_path, monkeypatch):
-    """IDLE is NOT terminal — should not suspend a fresh conversation."""
+async def test_not_suspendable_when_inner_reports_false(tmp_path, monkeypatch):
+    """Container is NOT suspendable when inner server reports suspendable=False."""
     reg = _registry(tmp_path, monkeypatch)
-    cont = _container(uuid4())
+    cid = uuid4()
+    cont = _container(cid)
 
     mock_response = MagicMock()
-    mock_response.status_code = 404
-
-    mock_fallback_response = MagicMock()
-    mock_fallback_response.is_error = False
-    mock_fallback_response.json.return_value = {"items": [{"execution_status": "idle"}]}
+    mock_response.status_code = 200
+    mock_response.is_error = False
+    mock_response.json.return_value = {"suspendable": False}
 
     mock_client = AsyncMock()
-    mock_client.get = AsyncMock(side_effect=[mock_response, mock_fallback_response])
+    mock_client.get = AsyncMock(return_value=mock_response)
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
-        result = await reg._is_suspendable(cont)
+        result = await reg._is_suspendable(cid, cont)
     assert result is False
 
 
@@ -120,7 +88,8 @@ async def test_not_suspendable_when_idle(tmp_path, monkeypatch):
 async def test_not_suspendable_when_inner_unreachable(tmp_path, monkeypatch):
     """If the inner container is unreachable, don't suspend it."""
     reg = _registry(tmp_path, monkeypatch)
-    cont = _container(uuid4())
+    cid = uuid4()
+    cont = _container(cid)
 
     mock_client = AsyncMock()
     mock_client.get = AsyncMock(side_effect=httpx.ConnectError("refused"))
@@ -128,32 +97,28 @@ async def test_not_suspendable_when_inner_unreachable(tmp_path, monkeypatch):
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
-        result = await reg._is_suspendable(cont)
+        result = await reg._is_suspendable(cid, cont)
     assert result is False
 
 
 @pytest.mark.asyncio
-async def test_not_suspendable_when_paused(tmp_path, monkeypatch):
-    """PAUSED is NOT terminal — user may resume. Don't suspend."""
+async def test_not_suspendable_when_inner_404(tmp_path, monkeypatch):
+    """If inner server returns 404, don't suspend it."""
     reg = _registry(tmp_path, monkeypatch)
-    cont = _container(uuid4())
+    cid = uuid4()
+    cont = _container(cid)
 
     mock_response = MagicMock()
     mock_response.status_code = 404
-
-    mock_fallback_response = MagicMock()
-    mock_fallback_response.is_error = False
-    mock_fallback_response.json.return_value = {
-        "items": [{"execution_status": "paused"}]
-    }
+    mock_response.is_error = True
 
     mock_client = AsyncMock()
-    mock_client.get = AsyncMock(side_effect=[mock_response, mock_fallback_response])
+    mock_client.get = AsyncMock(return_value=mock_response)
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
     with patch("httpx.AsyncClient", return_value=mock_client):
-        result = await reg._is_suspendable(cont)
+        result = await reg._is_suspendable(cid, cont)
     assert result is False
 
 

@@ -297,7 +297,7 @@ class DockerConversationRegistry(ConversationRegistry):
             if conversation_id in self._deleting:
                 continue
             try:
-                suspendable = await self._is_suspendable(container)
+                suspendable = await self._is_suspendable(conversation_id, container)
             except Exception:
                 logger.debug(
                     "Could not check suspend status for %s",
@@ -320,53 +320,34 @@ class DockerConversationRegistry(ConversationRegistry):
                     exc_info=True,
                 )
 
-    async def _is_suspendable(self, container: ConversationContainer) -> bool:
+    async def _is_suspendable(
+        self, conversation_id: UUID, container: ConversationContainer
+    ) -> bool:
         """Query the inner agent-server to decide if the container is idle.
 
         Returns ``True`` when the inner conversation is in a terminal
         execution state (finished / error / stuck) **and** reports no
-        external WebSocket subscribers.
+        external WebSocket subscribers or active runs.
         """
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
             ) as client:
                 resp = await client.get(
-                    f"{container.host}/api/suspend-check",
+                    f"{container.host}/api/conversations/{conversation_id}/suspend-check",
                     headers={"X-Session-API-Key": container.api_key},
                 )
                 if resp.status_code == 404:
-                    # Inner server doesn't have suspend-check endpoint yet;
-                    # fall back to checking conversation list.
-                    return await self._is_suspendable_fallback(client, container)
-                if resp.is_error:
+                    # Inner server may expose root suspend-check endpoint
+                    resp = await client.get(
+                        f"{container.host}/api/suspend-check?conversation_id={conversation_id}",
+                        headers={"X-Session-API-Key": container.api_key},
+                    )
+                if resp.status_code == 404 or resp.is_error:
                     return False
                 data = resp.json()
                 return bool(data.get("suspendable", False))
         except (httpx.HTTPError, Exception):
-            return False
-
-    async def _is_suspendable_fallback(
-        self, client: httpx.AsyncClient, container: ConversationContainer
-    ) -> bool:
-        """Fallback: check conversations list for terminal state."""
-        try:
-            resp = await client.get(
-                f"{container.host}/api/conversations",
-                headers={"X-Session-API-Key": container.api_key},
-            )
-            if resp.is_error:
-                return False
-            data = resp.json()
-            items = data.get("items", [data]) if isinstance(data, dict) else data
-            if not items:
-                return False
-            for item in items:
-                status = item.get("execution_status", "idle")
-                if status in ("finished", "error", "stuck"):
-                    return True
-            return False
-        except Exception:
             return False
 
     def _build_container(self, conversation_id: UUID) -> ConversationContainer:
