@@ -7,6 +7,7 @@ import hashlib
 import os
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -63,6 +64,29 @@ class ConversationContainer:
         return result.returncode == 0 and result.stdout.strip() == "true"
 
 
+@dataclass(slots=True)
+class ContainerLease:
+    """An active lease holding a container runtime against suspension."""
+
+    conversation_id: UUID
+    container: ConversationContainer
+    _release_fn: Callable[[], None]
+    _released: bool = False
+
+    def release(self) -> None:
+        if not self._released:
+            self._released = True
+            self._release_fn()
+
+    async def __aenter__(self) -> ConversationContainer:
+        return self.container
+
+    async def __aexit__(
+        self, exc_type: object, exc_val: object, exc_tb: object
+    ) -> None:
+        self.release()
+
+
 class DockerConversationRegistry(ConversationRegistry):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
@@ -75,6 +99,9 @@ class DockerConversationRegistry(ConversationRegistry):
         self._containers: dict[UUID, ConversationContainer] = {}
         self._starts: dict[UUID, asyncio.Task[ConversationContainer]] = {}
         self._deleting: set[UUID] = set()
+        self._stopping: dict[UUID, asyncio.Event] = {}
+        self._leases: dict[UUID, int] = {}
+        self._lease_generations: dict[UUID, int] = {}
         self._lock = asyncio.Lock()
         self._suspend_task: asyncio.Task[None] | None = None
 
@@ -183,14 +210,72 @@ class DockerConversationRegistry(ConversationRegistry):
         if ids:
             execute_command(["docker", "rm", "-f", *ids])
 
-    async def get_or_create(self, conversation_id: UUID) -> ConversationContainer:
-        async with self._lock:
-            if conversation_id in self._deleting:
-                raise RuntimeError("Conversation is being deleted")
-            container = self._containers.get(conversation_id)
+    def has_active_leases(self, conversation_id: UUID) -> bool:
+        return self._leases.get(conversation_id, 0) > 0
+
+    def release_lease(self, conversation_id: UUID) -> None:
+        """Release a previously acquired lease on a container runtime."""
+        count = self._leases.get(conversation_id, 0) - 1
+        if count <= 0:
+            self._leases.pop(conversation_id, None)
+        else:
+            self._leases[conversation_id] = count
+
+    def acquire_lease(self, conversation_id: UUID) -> Callable[[], None]:
+        """Record an active in-flight request or WebSocket for this conversation.
+
+        Returns a release callback.
+        """
+        self._leases[conversation_id] = self._leases.get(conversation_id, 0) + 1
+        self._lease_generations[conversation_id] = (
+            self._lease_generations.get(conversation_id, 0) + 1
+        )
+        released = False
+
+        def release() -> None:
+            nonlocal released
+            if not released:
+                released = True
+                self.release_lease(conversation_id)
+
+        return release
+
+    async def lease(self, conversation_id: UUID) -> ContainerLease:
+        """Acquire a container lease for an active request or WebSocket.
+
+        While a lease is held, the conversation runtime will not be suspended.
+        """
+        container = await self.get_or_create(conversation_id)
+        release = self.acquire_lease(conversation_id)
+        return ContainerLease(
+            conversation_id=conversation_id,
+            container=container,
+            _release_fn=release,
+        )
+
+    async def get_or_create(
+        self, conversation_id: UUID, *, lease: bool = False
+    ) -> ConversationContainer:
+        while True:
+            async with self._lock:
+                if conversation_id in self._deleting:
+                    raise RuntimeError("Conversation is being deleted")
+                stop_event = self._stopping.get(conversation_id)
+                if stop_event is None:
+                    container = self._containers.get(conversation_id)
+                    self._lease_generations[conversation_id] = (
+                        self._lease_generations.get(conversation_id, 0) + 1
+                    )
+                    break
+            await stop_event.wait()
 
         if container is not None:
             if await asyncio.to_thread(container.is_running):
+                if lease:
+                    async with self._lock:
+                        self._leases[conversation_id] = (
+                            self._leases.get(conversation_id, 0) + 1
+                        )
                 return container
             async with self._lock:
                 if self._containers.get(conversation_id) is container:
@@ -219,12 +304,18 @@ class DockerConversationRegistry(ConversationRegistry):
             if existing is not None:
                 if existing is not container:
                     await asyncio.to_thread(container.stop)
+                if lease:
+                    self._leases[conversation_id] = (
+                        self._leases.get(conversation_id, 0) + 1
+                    )
                 return existing
             if self._starts.get(conversation_id) is not task:
                 await asyncio.to_thread(container.stop)
                 raise RuntimeError("Conversation container start was cancelled")
             self._starts.pop(conversation_id, None)
             self._containers[conversation_id] = container
+            if lease:
+                self._leases[conversation_id] = self._leases.get(conversation_id, 0) + 1
             return container
 
     async def begin_delete(self, conversation_id: UUID) -> bool:
@@ -239,17 +330,55 @@ class DockerConversationRegistry(ConversationRegistry):
             self._deleting.discard(conversation_id)
 
     async def stop(self, conversation_id: UUID) -> None:
+        await self._stop(conversation_id)
+
+    async def stop_if_idle(self, conversation_id: UUID, token: int) -> bool:
+        return await self._stop(conversation_id, if_idle_token=token)
+
+    async def _stop(
+        self, conversation_id: UUID, *, if_idle_token: int | None = None
+    ) -> bool:
+        task: asyncio.Task[ConversationContainer] | None = None
+        container: ConversationContainer | None = None
         async with self._lock:
-            task = self._starts.pop(conversation_id, None)
-            container = self._containers.pop(conversation_id, None)
-        if task is not None:
-            try:
-                started = await task
-            except Exception:
-                started = None
-            container = container or started
-        if container is not None:
-            await asyncio.to_thread(container.stop)
+            if if_idle_token is not None:
+                if (
+                    conversation_id in self._deleting
+                    or conversation_id in self._stopping
+                    or self._leases.get(conversation_id, 0) > 0
+                    or self._lease_generations.get(conversation_id, 0) != if_idle_token
+                    or self._containers.get(conversation_id) is None
+                ):
+                    return False
+
+            stop_event = self._stopping.get(conversation_id)
+            if stop_event is not None:
+                wait_for_stop = True
+            else:
+                stop_event = asyncio.Event()
+                self._stopping[conversation_id] = stop_event
+                wait_for_stop = False
+                task = self._starts.pop(conversation_id, None)
+                container = self._containers.pop(conversation_id, None)
+
+        if wait_for_stop:
+            await stop_event.wait()
+            return True
+
+        try:
+            if task is not None:
+                try:
+                    started = await task
+                except Exception:
+                    started = None
+                container = container or started
+            if container is not None:
+                await asyncio.to_thread(container.stop)
+            return True
+        finally:
+            async with self._lock:
+                self._stopping.pop(conversation_id, None)
+                stop_event.set()
 
     async def shutdown(self) -> None:
         if self._suspend_task is not None:
@@ -294,8 +423,16 @@ class DockerConversationRegistry(ConversationRegistry):
             candidates = list(self._containers.items())
 
         for conversation_id, container in candidates:
-            if conversation_id in self._deleting:
-                continue
+            async with self._lock:
+                if (
+                    conversation_id in self._deleting
+                    or conversation_id in self._stopping
+                    or self._containers.get(conversation_id) is not container
+                    or self._leases.get(conversation_id, 0) > 0
+                ):
+                    continue
+                token = self._lease_generations.get(conversation_id, 0)
+
             try:
                 suspendable = await self._is_suspendable(conversation_id, container)
             except Exception:
@@ -305,14 +442,39 @@ class DockerConversationRegistry(ConversationRegistry):
                     exc_info=True,
                 )
                 continue
+
             if not suspendable:
                 continue
+
+            async with self._lock:
+                if (
+                    conversation_id in self._deleting
+                    or conversation_id in self._stopping
+                    or self._containers.get(conversation_id) is not container
+                    or self._leases.get(conversation_id, 0) > 0
+                    or self._lease_generations.get(conversation_id, 0) != token
+                ):
+                    logger.info(
+                        "Conversation %s was re-engaged or active during "
+                        "suspend check, skipping suspension",
+                        conversation_id,
+                    )
+                    continue
+
             try:
-                await self.stop(conversation_id)
-                logger.info(
-                    "Suspended idle container for conversation %s",
-                    conversation_id,
-                )
+                stopped = await self.stop_if_idle(conversation_id, token)
+
+                if stopped:
+                    logger.info(
+                        "Suspended idle container for conversation %s",
+                        conversation_id,
+                    )
+                else:
+                    logger.info(
+                        "Conversation %s was re-engaged or active during "
+                        "suspend check, skipping suspension",
+                        conversation_id,
+                    )
             except Exception:
                 logger.warning(
                     "Failed to suspend container for %s",

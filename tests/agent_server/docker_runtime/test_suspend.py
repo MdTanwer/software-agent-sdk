@@ -141,12 +141,13 @@ async def test_suspend_stops_terminal_container(tmp_path, monkeypatch):
     # Mock stop() to just remove from _containers
     stopped_ids = []
 
-    async def mock_stop(conversation_id):
+    async def mock_stop(conversation_id, *args, **kwargs):
         stopped_ids.append(conversation_id)
         async with reg._lock:
             reg._containers.pop(conversation_id, None)
+        return True
 
-    reg.stop = mock_stop
+    monkeypatch.setattr(reg, "_stop", mock_stop)
 
     await reg._suspend_idle_containers()
 
@@ -167,10 +168,11 @@ async def test_suspend_skips_active_container(tmp_path, monkeypatch):
 
     stopped_ids = []
 
-    async def mock_stop(conversation_id):
+    async def mock_stop(conversation_id, *args, **kwargs):
         stopped_ids.append(conversation_id)
+        return True
 
-    reg.stop = mock_stop
+    monkeypatch.setattr(reg, "_stop", mock_stop)
 
     await reg._suspend_idle_containers()
 
@@ -191,10 +193,11 @@ async def test_suspend_skips_deleting_container(tmp_path, monkeypatch):
 
     stopped_ids = []
 
-    async def mock_stop(conversation_id):
+    async def mock_stop(conversation_id, *args, **kwargs):
         stopped_ids.append(conversation_id)
+        return True
 
-    reg.stop = mock_stop
+    monkeypatch.setattr(reg, "_stop", mock_stop)
 
     await reg._suspend_idle_containers()
 
@@ -216,14 +219,15 @@ async def test_suspend_handles_stop_failure_gracefully(tmp_path, monkeypatch):
 
     stopped_ids = []
 
-    async def mock_stop(conversation_id):
+    async def mock_stop(conversation_id, *args, **kwargs):
         if conversation_id == cid1:
             raise RuntimeError("Docker daemon error")
         stopped_ids.append(conversation_id)
         async with reg._lock:
             reg._containers.pop(conversation_id, None)
+        return True
 
-    reg.stop = mock_stop
+    monkeypatch.setattr(reg, "_stop", mock_stop)
 
     # Should not raise, even though stopping cid1 fails
     await reg._suspend_idle_containers()
@@ -314,3 +318,103 @@ async def test_shutdown_cancels_suspend_task(tmp_path, monkeypatch):
 
     await reg.shutdown()
     assert reg._suspend_task is None
+
+
+# ------------------------------------------------------------------
+# Lease tracking and atomic check-then-stop tests
+# ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_suspend_skips_when_active_lease_held(tmp_path, monkeypatch):
+    """A container with an active lease should NOT be suspended."""
+    reg = _registry(tmp_path, monkeypatch)
+    cid = uuid4()
+    cont = _container(cid)
+    reg._containers[cid] = cont
+
+    # Acquire lease
+    release = reg.acquire_lease(cid)
+    assert reg.has_active_leases(cid)
+
+    reg._is_suspendable = AsyncMock(return_value=True)
+    stopped_ids = []
+
+    async def mock_stop(conversation_id, *args, **kwargs):
+        stopped_ids.append(conversation_id)
+        return True
+
+    monkeypatch.setattr(reg, "_stop", mock_stop)
+
+    await reg._suspend_idle_containers()
+
+    assert cid not in stopped_ids
+    assert cid in reg._containers
+    reg._is_suspendable.assert_not_called()
+
+    # Once released, it becomes suspendable
+    release()
+    assert not reg.has_active_leases(cid)
+    await reg._suspend_idle_containers()
+    assert cid in stopped_ids
+
+
+@pytest.mark.asyncio
+async def test_suspend_aborts_when_re_engaged_during_check(tmp_path, monkeypatch):
+    """If a request arrives while _is_suspendable is in flight, abort suspension."""
+    reg = _registry(tmp_path, monkeypatch)
+    cid = uuid4()
+    cont = _container(cid)
+    reg._containers[cid] = cont
+
+    # Simulate request arriving during the probe
+    async def mock_is_suspendable(conversation_id, container):
+        # A request arrives and acquires a lease during the network probe
+        reg.acquire_lease(conversation_id)
+        return True
+
+    reg._is_suspendable = mock_is_suspendable
+    stopped_ids = []
+
+    async def mock_stop(conversation_id, *args, **kwargs):
+        stopped_ids.append(conversation_id)
+        return True
+
+    monkeypatch.setattr(reg, "_stop", mock_stop)
+
+    await reg._suspend_idle_containers()
+
+    # The container was re-engaged during probe, so it must not be stopped!
+    assert cid not in stopped_ids
+    assert cid in reg._containers
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_waits_for_stopping_container(tmp_path, monkeypatch):
+    """get_or_create should wait if container is stopping, then build fresh."""
+    reg = _registry(tmp_path, monkeypatch)
+    cid = uuid4()
+    original = _container(cid)
+    reg._containers[cid] = original
+
+    # When stop begins, the container is popped and marked stopping
+    stop_event = asyncio.Event()
+    reg._stopping[cid] = stop_event
+    reg._containers.pop(cid, None)
+
+    resumed = _container(cid)
+    resumed.container_id = "rebuilt-after-stop"
+    reg._build_container = lambda conversation_id: resumed
+
+    task = asyncio.create_task(reg.get_or_create(cid))
+    await asyncio.sleep(0.01)
+    # task should be waiting on stop_event
+    assert not task.done()
+
+    # Simulate stop completion
+    reg._stopping.pop(cid, None)
+    stop_event.set()
+
+    result = await task
+    assert result is resumed
+    assert result.container_id == "rebuilt-after-stop"

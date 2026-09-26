@@ -101,6 +101,7 @@ async def start_conversation(
     body["workspace"] = {"kind": "LocalWorkspace", "working_dir": "/workspace"}
 
     registry = get_registry(request)
+    release = None
     try:
         prepared, launched = await prepare_start(body, registry.config)
         identity = registry.provisioning.create(conversation_id, host_workspace)
@@ -108,6 +109,11 @@ async def start_conversation(
             identity = identity.model_copy(update={"launched_agent_profile": launched})
             registry.provisioning.save(identity)
         container = await registry.get_or_create(conversation_id)
+        release = (
+            registry.acquire_lease(conversation_id)
+            if hasattr(registry, "acquire_lease")
+            else None
+        )
         payload = serialize_start(prepared, identity)
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
@@ -134,6 +140,9 @@ async def start_conversation(
         await registry.stop(conversation_id)
         logger.exception("Could not create conversation container")
         raise HTTPException(502, "Could not create conversation container") from exc
+    finally:
+        if release is not None:
+            release()
 
     content = response.json() if response.content else None
     if response.is_error:
@@ -167,6 +176,8 @@ async def docker_suspend_check(
     registry = get_registry(request)
     if not registry.conversation_dir(conversation_id).joinpath("meta.json").is_file():
         raise HTTPException(404, "Conversation not found")
+    if registry.has_active_leases(conversation_id):
+        return ConversationSuspendStatus(suspendable=False)
     container = registry.get(conversation_id)
     if container is None:
         return ConversationSuspendStatus(suspendable=True)
@@ -268,36 +279,49 @@ async def proxy_conversation(
         raise HTTPException(501, "This operation is unavailable in Docker runtime mode")
     registry = get_registry(request)
     container = await _container(registry, conversation_id)
+    release = (
+        registry.acquire_lease(conversation_id)
+        if hasattr(registry, "acquire_lease")
+        else None
+    )
     upstream_path = _upstream_path(request, request.url.path)
-    if tail == "secrets" and request.method == "POST":
-        try:
-            update = UpdateSecretsRequest.model_validate_json(await request.body())
-        except ValueError as exc:
-            raise HTTPException(422, "Invalid secrets payload") from exc
-        profile = registry.provisioning.load(conversation_id).launched_agent_profile
-        secrets = update.secrets
-        if profile is not None:
-            secrets = {
-                name: source
-                for name, source in secrets.items()
-                if profile.allows_secret(name)
-            }
-        materialized = await asyncio.to_thread(materialize_secrets, secrets)
-        body = UpdateSecretsRequest(secrets=materialized).model_dump(
-            mode="json", context={"expose_secrets": "plaintext"}
-        )
-        response = await proxy_http(
-            request,
-            container,
-            upstream_path=upstream_path,
-            body=json.dumps(body).encode(),
-        )
-    else:
-        response = await proxy_http(
-            request,
-            container,
-            upstream_path=upstream_path,
-        )
+    try:
+        if tail == "secrets" and request.method == "POST":
+            try:
+                update = UpdateSecretsRequest.model_validate_json(await request.body())
+            except ValueError as exc:
+                raise HTTPException(422, "Invalid secrets payload") from exc
+            profile = registry.provisioning.load(conversation_id).launched_agent_profile
+            secrets = update.secrets
+            if profile is not None:
+                secrets = {
+                    name: source
+                    for name, source in secrets.items()
+                    if profile.allows_secret(name)
+                }
+            materialized = await asyncio.to_thread(materialize_secrets, secrets)
+            body = UpdateSecretsRequest(secrets=materialized).model_dump(
+                mode="json", context={"expose_secrets": "plaintext"}
+            )
+            response = await proxy_http(
+                request,
+                container,
+                upstream_path=upstream_path,
+                body=json.dumps(body).encode(),
+                on_close=release,
+            )
+        else:
+            response = await proxy_http(
+                request,
+                container,
+                upstream_path=upstream_path,
+                on_close=release,
+            )
+    except Exception:
+        if release is not None:
+            release()
+        raise
+
     if request.method not in {"GET", "HEAD", "OPTIONS"} and response.status_code < 400:
         await get_conversation_service(request).refresh_persisted_conversation(
             conversation_id
@@ -314,13 +338,24 @@ async def proxy_workspace_file(
 ) -> StreamingResponse:
     registry = get_registry(request)
     container = await _container(registry, conversation_id)
-    return await proxy_http(
-        request,
-        container,
-        upstream_path=_upstream_path(
-            request, f"/api/conversations/{conversation_id}/workspace/{file_path}"
-        ),
+    release = (
+        registry.acquire_lease(conversation_id)
+        if hasattr(registry, "acquire_lease")
+        else None
     )
+    try:
+        return await proxy_http(
+            request,
+            container,
+            upstream_path=_upstream_path(
+                request, f"/api/conversations/{conversation_id}/workspace/{file_path}"
+            ),
+            on_close=release,
+        )
+    except Exception:
+        if release is not None:
+            release()
+        raise
 
 
 docker_sockets_router = APIRouter(prefix="/sockets", tags=["Docker WebSockets"])
@@ -346,6 +381,11 @@ async def _proxy_socket(
     except HTTPException as exc:
         await websocket.close(code=1008 if exc.status_code == 404 else 1011)
         return
+    release = (
+        registry.acquire_lease(conversation_id)
+        if hasattr(registry, "acquire_lease")
+        else None
+    )
     query = strip_auth_query("?" + websocket.url.query).lstrip("?")
     path = f"/sockets/{socket_name}/{conversation_id}"
     try:
@@ -355,6 +395,8 @@ async def _proxy_socket(
             upstream_path=f"{path}?{query}" if query else path,
         )
     finally:
+        if release is not None:
+            release()
         await websocket.app.state.conversation_service.refresh_persisted_conversation(
             conversation_id
         )
