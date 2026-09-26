@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import AsyncIterator, Callable
 from contextlib import AsyncExitStack
 from typing import Any, Protocol
@@ -79,7 +80,7 @@ async def _invoke_close(callback: Callable[[], Any] | None) -> None:
         return
     try:
         res = callback()
-        if asyncio.iscoroutine(res):
+        if inspect.isawaitable(res):
             await res
     except Exception:
         logger.debug("Error in proxy on_close callback", exc_info=True)
@@ -106,8 +107,10 @@ async def proxy_http(
         timeout: Per-request timeout in seconds. ``None`` (the default) means
             no read timeout — conversation event streams can be long-lived.
         body: Replacement request body. By default the incoming body is streamed.
-        on_close: Optional callback invoked when the response stream completes
-            or fails.
+        on_close: Awaited or invoked once the streamed response is fully consumed,
+            client disconnects, or connection fails. Callers use this to release
+            a session attachment or lease that must outlive the route handler
+            (see ``DockerConversationRegistry.attach_session``).
 
     Notes:
         A fresh :class:`httpx.AsyncClient` is created per request. We avoid a

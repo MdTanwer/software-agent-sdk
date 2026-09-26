@@ -65,6 +65,46 @@ def _upstream_path(request: Request, path: str) -> str:
     return f"{path}?{query}" if query else path
 
 
+async def _proxy_with_session(
+    registry: DockerConversationRegistry,
+    conversation_id: UUID,
+    container: ConversationContainer,
+    request: Request,
+    *,
+    upstream_path: str,
+    body: bytes | None = None,
+) -> StreamingResponse:
+    """Proxy one request while holding an outer session attachment.
+
+    The attachment is released when the streamed response finishes (or the
+    client disconnects), so a long-lived proxied stream keeps the container
+    from being evicted while a client is still reading from it.
+    """
+    registry.attach_session(conversation_id)
+    release = (
+        registry.acquire_lease(conversation_id)
+        if hasattr(registry, "acquire_lease")
+        else None
+    )
+
+    async def detach() -> None:
+        if release is not None:
+            release()
+        registry.detach_session(conversation_id)
+
+    try:
+        return await proxy_http(
+            request,
+            container,
+            upstream_path=upstream_path,
+            body=body,
+            on_close=detach,
+        )
+    except BaseException:
+        await detach()
+        raise
+
+
 docker_conversation_router = APIRouter(
     prefix="/conversations", tags=["Docker Conversations"]
 )
@@ -174,9 +214,9 @@ async def docker_suspend_check(
     conversation_id: UUID, request: Request
 ) -> ConversationSuspendStatus:
     registry = get_registry(request)
-    if not registry.conversation_dir(conversation_id).joinpath("meta.json").is_file():
-        raise HTTPException(404, "Conversation not found")
-    if registry.has_active_leases(conversation_id):
+    if registry.has_active_leases(conversation_id) or registry.has_attached_sessions(
+        conversation_id
+    ):
         return ConversationSuspendStatus(suspendable=False)
     container = registry.get(conversation_id)
     if container is None:
@@ -279,49 +319,40 @@ async def proxy_conversation(
         raise HTTPException(501, "This operation is unavailable in Docker runtime mode")
     registry = get_registry(request)
     container = await _container(registry, conversation_id)
-    release = (
-        registry.acquire_lease(conversation_id)
-        if hasattr(registry, "acquire_lease")
-        else None
-    )
     upstream_path = _upstream_path(request, request.url.path)
-    try:
-        if tail == "secrets" and request.method == "POST":
-            try:
-                update = UpdateSecretsRequest.model_validate_json(await request.body())
-            except ValueError as exc:
-                raise HTTPException(422, "Invalid secrets payload") from exc
-            profile = registry.provisioning.load(conversation_id).launched_agent_profile
-            secrets = update.secrets
-            if profile is not None:
-                secrets = {
-                    name: source
-                    for name, source in secrets.items()
-                    if profile.allows_secret(name)
-                }
-            materialized = await asyncio.to_thread(materialize_secrets, secrets)
-            body = UpdateSecretsRequest(secrets=materialized).model_dump(
-                mode="json", context={"expose_secrets": "plaintext"}
-            )
-            response = await proxy_http(
-                request,
-                container,
-                upstream_path=upstream_path,
-                body=json.dumps(body).encode(),
-                on_close=release,
-            )
-        else:
-            response = await proxy_http(
-                request,
-                container,
-                upstream_path=upstream_path,
-                on_close=release,
-            )
-    except Exception:
-        if release is not None:
-            release()
-        raise
-
+    if tail == "secrets" and request.method == "POST":
+        try:
+            update = UpdateSecretsRequest.model_validate_json(await request.body())
+        except ValueError as exc:
+            raise HTTPException(422, "Invalid secrets payload") from exc
+        profile = registry.provisioning.load(conversation_id).launched_agent_profile
+        secrets = update.secrets
+        if profile is not None:
+            secrets = {
+                name: source
+                for name, source in secrets.items()
+                if profile.allows_secret(name)
+            }
+        materialized = await asyncio.to_thread(materialize_secrets, secrets)
+        body = UpdateSecretsRequest(secrets=materialized).model_dump(
+            mode="json", context={"expose_secrets": "plaintext"}
+        )
+        response = await _proxy_with_session(
+            registry,
+            conversation_id,
+            container,
+            request,
+            upstream_path=upstream_path,
+            body=json.dumps(body).encode(),
+        )
+    else:
+        response = await _proxy_with_session(
+            registry,
+            conversation_id,
+            container,
+            request,
+            upstream_path=upstream_path,
+        )
     if request.method not in {"GET", "HEAD", "OPTIONS"} and response.status_code < 400:
         await get_conversation_service(request).refresh_persisted_conversation(
             conversation_id
@@ -338,24 +369,15 @@ async def proxy_workspace_file(
 ) -> StreamingResponse:
     registry = get_registry(request)
     container = await _container(registry, conversation_id)
-    release = (
-        registry.acquire_lease(conversation_id)
-        if hasattr(registry, "acquire_lease")
-        else None
+    return await _proxy_with_session(
+        registry,
+        conversation_id,
+        container,
+        request,
+        upstream_path=_upstream_path(
+            request, f"/api/conversations/{conversation_id}/workspace/{file_path}"
+        ),
     )
-    try:
-        return await proxy_http(
-            request,
-            container,
-            upstream_path=_upstream_path(
-                request, f"/api/conversations/{conversation_id}/workspace/{file_path}"
-            ),
-            on_close=release,
-        )
-    except Exception:
-        if release is not None:
-            release()
-        raise
 
 
 docker_sockets_router = APIRouter(prefix="/sockets", tags=["Docker WebSockets"])
@@ -388,6 +410,9 @@ async def _proxy_socket(
     )
     query = strip_auth_query("?" + websocket.url.query).lstrip("?")
     path = f"/sockets/{socket_name}/{conversation_id}"
+    # Hold the attachment for the whole bridge lifetime so the idle-eviction
+    # loop cannot stop the container under a live events/session websocket.
+    registry.attach_session(conversation_id)
     try:
         await bridge_websocket(
             websocket,
@@ -397,6 +422,7 @@ async def _proxy_socket(
     finally:
         if release is not None:
             release()
+        registry.detach_session(conversation_id)
         await websocket.app.state.conversation_service.refresh_persisted_conversation(
             conversation_id
         )
