@@ -274,27 +274,27 @@ async def test_resume_after_suspend_via_get_or_create(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_start_creates_suspend_task_when_ttl_set(tmp_path, monkeypatch):
-    """start() should launch the suspend loop when TTL is configured."""
+async def test_start_creates_eviction_task_when_ttl_set(tmp_path, monkeypatch):
+    """start() should launch the eviction loop when TTL is configured."""
     reg = _registry(tmp_path, monkeypatch)
     monkeypatch.setattr(reg, "cleanup_stale_containers", lambda: None)
 
     await reg.start()
 
-    assert reg._suspend_task is not None
-    assert not reg._suspend_task.done()
+    assert reg._eviction_task is not None
+    assert not reg._eviction_task.done()
 
     # Cleanup
-    reg._suspend_task.cancel()
+    reg._eviction_task.cancel()
     try:
-        await reg._suspend_task
+        await reg._eviction_task
     except asyncio.CancelledError:
         pass
 
 
 @pytest.mark.asyncio
-async def test_start_no_suspend_task_when_ttl_none(tmp_path, monkeypatch):
-    """start() should NOT launch suspend loop when TTL is None."""
+async def test_start_no_eviction_task_when_ttl_none(tmp_path, monkeypatch):
+    """start() should NOT launch eviction loop when TTL is None."""
     monkeypatch.setenv("OH_PERSISTENCE_DIR", str(tmp_path / "persistence"))
     reg = DockerConversationRegistry(
         Config(
@@ -308,20 +308,20 @@ async def test_start_no_suspend_task_when_ttl_none(tmp_path, monkeypatch):
 
     await reg.start()
 
-    assert reg._suspend_task is None
+    assert reg._eviction_task is None
 
 
 @pytest.mark.asyncio
-async def test_shutdown_cancels_suspend_task(tmp_path, monkeypatch):
-    """shutdown() should cancel the suspend loop task."""
+async def test_shutdown_cancels_eviction_task(tmp_path, monkeypatch):
+    """shutdown() should cancel the eviction loop task."""
     reg = _registry(tmp_path, monkeypatch)
     monkeypatch.setattr(reg, "cleanup_stale_containers", lambda: None)
 
     await reg.start()
-    assert reg._suspend_task is not None
+    assert reg._eviction_task is not None
 
     await reg.shutdown()
-    assert reg._suspend_task is None
+    assert reg._eviction_task is None
 
 
 # ------------------------------------------------------------------
@@ -445,6 +445,7 @@ async def test_is_suspendable_against_real_inner_app(tmp_path, monkeypatch):
     conv = MagicMock()
     conv.execution_status = ConversationExecutionStatus.FINISHED
     mock_service.get_conversation = AsyncMock(return_value=conv)
+    mock_service.is_conversation_idle_evictable.return_value = True
     ev_service = MagicMock()
     ev_service.is_idle_evictable.return_value = True
     mock_service._event_services = {cid: ev_service}

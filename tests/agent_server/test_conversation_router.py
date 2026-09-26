@@ -2772,10 +2772,7 @@ def test_suspend_check_terminal_and_evictable(
     conv = MagicMock()
     conv.execution_status = status
     mock_conversation_service.get_conversation.return_value = conv
-
-    event_service = MagicMock()
-    event_service.is_idle_evictable.return_value = True
-    mock_conversation_service._event_services = {cid: event_service}
+    mock_conversation_service.is_conversation_idle_evictable.return_value = True
 
     client.app.dependency_overrides[get_conversation_service] = lambda: (
         mock_conversation_service
@@ -2801,10 +2798,7 @@ def test_suspend_check_non_terminal(client, mock_conversation_service, status):
     conv = MagicMock()
     conv.execution_status = status
     mock_conversation_service.get_conversation.return_value = conv
-
-    event_service = MagicMock()
-    event_service.is_idle_evictable.return_value = True
-    mock_conversation_service._event_services = {cid: event_service}
+    mock_conversation_service.is_conversation_idle_evictable.return_value = True
 
     client.app.dependency_overrides[get_conversation_service] = lambda: (
         mock_conversation_service
@@ -2822,10 +2816,7 @@ def test_suspend_check_terminal_not_evictable(client, mock_conversation_service)
     conv = MagicMock()
     conv.execution_status = ConversationExecutionStatus.FINISHED
     mock_conversation_service.get_conversation.return_value = conv
-
-    event_service = MagicMock()
-    event_service.is_idle_evictable.return_value = False
-    mock_conversation_service._event_services = {cid: event_service}
+    mock_conversation_service.is_conversation_idle_evictable.return_value = False
 
     client.app.dependency_overrides[get_conversation_service] = lambda: (
         mock_conversation_service

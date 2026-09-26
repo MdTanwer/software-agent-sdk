@@ -230,11 +230,8 @@ async def check_conversation_suspendable(
     if not conversation.execution_status.is_terminal():
         return ConversationSuspendStatus(suspendable=False)
 
-    event_services = conversation_service._event_services
-    if event_services is not None:
-        event_service = event_services.get(conversation_id)
-        if event_service is not None and not event_service.is_idle_evictable():
-            return ConversationSuspendStatus(suspendable=False)
+    if not conversation_service.is_conversation_idle_evictable(conversation_id):
+        return ConversationSuspendStatus(suspendable=False)
 
     return ConversationSuspendStatus(suspendable=True)
 

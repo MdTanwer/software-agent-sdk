@@ -81,15 +81,10 @@ async def _proxy_with_session(
     from being evicted while a client is still reading from it.
     """
     registry.attach_session(conversation_id)
-    release = (
-        registry.acquire_lease(conversation_id)
-        if hasattr(registry, "acquire_lease")
-        else None
-    )
+    release = registry.acquire_lease(conversation_id)
 
     async def detach() -> None:
-        if release is not None:
-            release()
+        release()
         registry.detach_session(conversation_id)
 
     try:
@@ -149,11 +144,7 @@ async def start_conversation(
             identity = identity.model_copy(update={"launched_agent_profile": launched})
             registry.provisioning.save(identity)
         container = await registry.get_or_create(conversation_id)
-        release = (
-            registry.acquire_lease(conversation_id)
-            if hasattr(registry, "acquire_lease")
-            else None
-        )
+        release = registry.acquire_lease(conversation_id)
         payload = serialize_start(prepared, identity)
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
@@ -403,11 +394,7 @@ async def _proxy_socket(
     except HTTPException as exc:
         await websocket.close(code=1008 if exc.status_code == 404 else 1011)
         return
-    release = (
-        registry.acquire_lease(conversation_id)
-        if hasattr(registry, "acquire_lease")
-        else None
-    )
+    release = registry.acquire_lease(conversation_id)
     query = strip_auth_query("?" + websocket.url.query).lstrip("?")
     path = f"/sockets/{socket_name}/{conversation_id}"
     # Hold the attachment for the whole bridge lifetime so the idle-eviction
