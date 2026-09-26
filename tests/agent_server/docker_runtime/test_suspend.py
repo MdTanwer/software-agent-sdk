@@ -6,13 +6,17 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from fastapi import FastAPI, HTTPException
 from pydantic import SecretStr
 
 from openhands.agent_server.config import Config
+from openhands.agent_server.conversation_router import conversation_router
+from openhands.agent_server.dependencies import get_conversation_service
 from openhands.agent_server.docker_runtime.registry import (
     ConversationContainer,
     DockerConversationRegistry,
 )
+from openhands.sdk.conversation.state import ConversationExecutionStatus
 
 
 def _registry(tmp_path, monkeypatch) -> DockerConversationRegistry:
@@ -418,3 +422,50 @@ async def test_get_or_create_waits_for_stopping_container(tmp_path, monkeypatch)
     result = await task
     assert result is resumed
     assert result.container_id == "rebuilt-after-stop"
+
+
+@pytest.mark.asyncio
+async def test_is_suspendable_against_real_inner_app(tmp_path, monkeypatch):
+    """Verify _is_suspendable against real FastAPI inner routes via ASGITransport."""
+    reg = _registry(tmp_path, monkeypatch)
+    cid = uuid4()
+    cont = ConversationContainer(
+        host="http://127.0.0.1",
+        api_key="inner-key",
+        container_id=f"container-{cid}",
+    )
+
+    inner_app = FastAPI()
+    inner_app.include_router(conversation_router, prefix="/api")
+
+    mock_service = MagicMock()
+    inner_app.dependency_overrides[get_conversation_service] = lambda: mock_service
+
+    # 1. When conversation is finished and idle_evictable -> True
+    conv = MagicMock()
+    conv.execution_status = ConversationExecutionStatus.FINISHED
+    mock_service.get_conversation = AsyncMock(return_value=conv)
+    ev_service = MagicMock()
+    ev_service.is_idle_evictable.return_value = True
+    mock_service._event_services = {cid: ev_service}
+
+    transport = httpx.ASGITransport(app=inner_app)
+    real_async_client = httpx.AsyncClient
+
+    with patch(
+        "httpx.AsyncClient",
+        side_effect=lambda *args, **kwargs: real_async_client(
+            transport=transport, base_url="http://127.0.0.1"
+        ),
+    ):
+        assert await reg._is_suspendable(cid, cont) is True
+
+        # 2. When conversation is still running -> False
+        conv.execution_status = ConversationExecutionStatus.RUNNING
+        assert await reg._is_suspendable(cid, cont) is False
+
+        # 3. When conversation does not exist (404) -> False
+        mock_service.get_conversation = AsyncMock(
+            side_effect=HTTPException(status_code=404, detail="Not found")
+        )
+        assert await reg._is_suspendable(cid, cont) is False
