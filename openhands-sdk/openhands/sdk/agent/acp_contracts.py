@@ -141,6 +141,13 @@ class ACPLegacyModelSwitchConnection(Protocol):
     async def set_session_model(self, *, model_id: str, session_id: str) -> Any: ...
 
 
+def supports_legacy_model_switch(conn: Any) -> bool:
+    """Return True if conn supports the legacy set_session_model RPC."""
+    return isinstance(conn, ACPLegacyModelSwitchConnection) or hasattr(
+        conn, "set_session_model"
+    )
+
+
 @dataclass(frozen=True)
 class ACPConfigSelectOption:
     """Normalized config select option from a session response."""
@@ -393,4 +400,4 @@ class ACPModelDumpable(Protocol):
 
 def is_model_dumpable(obj: Any) -> bool:
     """Return True if obj is a BaseModel or implements model_dump()."""
-    return isinstance(obj, (BaseModel, ACPModelDumpable))
+    return isinstance(obj, (BaseModel, ACPModelDumpable)) or hasattr(obj, "model_dump")

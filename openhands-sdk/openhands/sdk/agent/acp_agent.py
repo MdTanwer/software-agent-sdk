@@ -32,7 +32,6 @@ from collections.abc import (
     Callable,
     Collection,
     Generator,
-    Iterable,
     Sequence,
 )
 from concurrent.futures import Future
@@ -83,14 +82,12 @@ from pydantic import (
 )
 
 from openhands.sdk.agent.acp_contracts import (
-    ACPConfigSelectOption,
-    ACPLegacyModelSwitchConnection,
-    extract_model_config_option,
     extract_session_models,
     is_model_dumpable,
     normalize_acp_error,
     normalize_auth_method,
     normalize_mcp_capabilities,
+    supports_legacy_model_switch,
 )
 from openhands.sdk.agent.acp_file_credentials import (
     ACPFileCredentialLifecycle,
@@ -601,19 +598,6 @@ def _model_config_options(
     return ((_MODEL_CONFIG_OPTION_ID, model),)
 
 
-def _model_config_option(response: Any) -> ACPConfigSelectOption | None:
-    """Return the ``model`` ``configOptions`` select off a session response.
-
-    Newer ACP CLIs dropped the UNSTABLE ``models`` capability and expose model
-    selection as a ``configOptions`` entry with ``id == "model"`` (``type ==
-    "select"``), switched via ``session/set_config_option`` instead of
-    ``session/set_model``. Returns that option (carrying ``options`` and
-    ``current_value``) or ``None`` when the server uses neither / the old
-    mechanism.
-    """
-    return extract_model_config_option(response)
-
-
 async def _apply_acp_model(
     conn: ClientSideConnection,
     session_id: str,
@@ -643,14 +627,8 @@ async def _apply_acp_model(
             await conn.set_config_option(
                 config_id=config_id, value=value, session_id=session_id
             )
-    elif isinstance(conn, ACPLegacyModelSwitchConnection):
-        await conn.set_session_model(model_id=model, session_id=session_id)
-
-
-def _usable_models(infos: Iterable[ACPModelInfo]) -> list[ACPModelInfo]:
-    """Drop entries without a usable ``model_id`` — an empty/missing id is an
-    invalid picker option and an unusable model-switch target."""
-    return [info for info in infos if info.model_id]
+    elif supports_legacy_model_switch(conn):
+        await conn.set_session_model(model_id=model, session_id=session_id)  # type: ignore[attr-defined]
 
 
 def _extract_session_models(
@@ -1128,9 +1106,10 @@ def _acp_error_indicates_auth(exc: BaseException) -> bool:
     auth marker is an upstream 401/403 the server collapsed into a generic internal
     error.  Either way the client should offer re-authentication.
     """
-    info = normalize_acp_error(exc)
-    if isinstance(exc, ACPRequestError) and info.code == -32000:
-        return True
+    if isinstance(exc, ACPRequestError):
+        info = normalize_acp_error(exc)
+        if info.code == -32000:
+            return True
     text = _acp_error_text(exc)
     return any(marker in text for marker in _ACP_AUTH_ERROR_MARKERS) or bool(
         _ACP_AUTH_HTTP_CODES_RE.search(text)
