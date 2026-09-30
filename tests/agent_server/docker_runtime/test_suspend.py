@@ -240,6 +240,90 @@ async def test_suspend_handles_stop_failure_gracefully(tmp_path, monkeypatch):
     assert cid1 in reg._containers  # still there because stop failed
 
 
+@pytest.mark.asyncio
+async def test_suspend_handles_real_stop_failure_gracefully(tmp_path, monkeypatch):
+    """Real _stop failure during _suspend_idle_containers keeps container tracked."""
+    reg = _registry(tmp_path, monkeypatch)
+    cid1 = uuid4()
+    cid2 = uuid4()
+    cont1 = _container(cid1)
+    cont2 = _container(cid2)
+    reg._containers[cid1] = cont1
+    reg._containers[cid2] = cont2
+
+    reg._is_suspendable = AsyncMock(return_value=True)
+
+    def mock_container_stop(self):
+        if self.container_id == cont1.container_id:
+            raise RuntimeError("Docker daemon error")
+
+    monkeypatch.setattr(ConversationContainer, "stop", mock_container_stop)
+
+    # Should not raise, even though stopping cid1 fails
+    await reg._suspend_idle_containers()
+
+    assert cid1 in reg._containers  # preserved because stop failed!
+    assert cid2 not in reg._containers  # removed because stop succeeded!
+
+
+@pytest.mark.asyncio
+async def test_stop_failure_retains_container_in_registry(tmp_path, monkeypatch):
+    """When docker stop fails, the container must remain tracked in _containers."""
+    reg = _registry(tmp_path, monkeypatch)
+    cid = uuid4()
+    cont = _container(cid)
+    monkeypatch.setattr(
+        ConversationContainer,
+        "stop",
+        MagicMock(side_effect=RuntimeError("transient docker stop failure")),
+    )
+    reg._containers[cid] = cont
+    token = reg._lease_generations.get(cid, 0)
+
+    with pytest.raises(RuntimeError, match="transient docker stop failure"):
+        await reg.stop_if_idle(cid, token)
+
+    assert cid in reg._containers
+    assert reg._containers[cid] is cont
+    assert cid not in reg._stopping
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_after_failed_stop_does_not_create_duplicate(
+    tmp_path, monkeypatch
+):
+    """If stop failed and container is still running, get_or_create reuses it."""
+    reg = _registry(tmp_path, monkeypatch)
+    cid = uuid4()
+    cont = _container(cid)
+    monkeypatch.setattr(
+        ConversationContainer,
+        "stop",
+        MagicMock(side_effect=RuntimeError("transient docker stop failure")),
+    )
+    monkeypatch.setattr(
+        ConversationContainer, "is_running", MagicMock(return_value=True)
+    )
+    reg._containers[cid] = cont
+    token = reg._lease_generations.get(cid, 0)
+
+    with pytest.raises(RuntimeError):
+        await reg.stop_if_idle(cid, token)
+
+    build_called = False
+
+    def mock_build(conversation_id: UUID) -> ConversationContainer:
+        nonlocal build_called
+        build_called = True
+        return _container(conversation_id)
+
+    reg._build_container = mock_build
+
+    reused = await reg.get_or_create(cid)
+    assert reused is cont
+    assert not build_called
+
+
 # ------------------------------------------------------------------
 # Resume after suspend (integration-like)
 # ------------------------------------------------------------------
@@ -401,7 +485,7 @@ async def test_get_or_create_waits_for_stopping_container(tmp_path, monkeypatch)
     original = _container(cid)
     reg._containers[cid] = original
 
-    # When stop begins, the container is popped and marked stopping
+    # Simulate an in-flight stop that has marked the container stopping
     stop_event = asyncio.Event()
     reg._stopping[cid] = stop_event
     reg._containers.pop(cid, None)

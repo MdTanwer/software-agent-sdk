@@ -83,9 +83,14 @@ async def _proxy_with_session(
     registry.attach_session(conversation_id)
     release = registry.acquire_lease(conversation_id)
 
+    detached = False
+
     async def detach() -> None:
-        release()
-        registry.detach_session(conversation_id)
+        nonlocal detached
+        if not detached:
+            detached = True
+            release()
+            registry.detach_session(conversation_id)
 
     try:
         return await proxy_http(

@@ -390,9 +390,7 @@ class DockerConversationRegistry(ConversationRegistry):
                 self._stopping[conversation_id] = stop_event
                 wait_for_stop = False
                 task = self._starts.pop(conversation_id, None)
-                container = self._containers.pop(conversation_id, None)
-                self._last_access.pop(conversation_id, None)
-                self._sessions.pop(conversation_id, None)
+                container = self._containers.get(conversation_id)
 
         if wait_for_stop:
             await stop_event.wait()
@@ -407,7 +405,19 @@ class DockerConversationRegistry(ConversationRegistry):
                 container = container or started
             if container is not None:
                 await asyncio.to_thread(container.stop)
+            async with self._lock:
+                if self._containers.get(conversation_id) is container:
+                    self._containers.pop(conversation_id, None)
+                    self._last_access.pop(conversation_id, None)
+                    self._sessions.pop(conversation_id, None)
             return True
+        except Exception:
+            if container is not None:
+                async with self._lock:
+                    if conversation_id not in self._containers:
+                        self._containers[conversation_id] = container
+                    self._last_access[conversation_id] = time.monotonic()
+            raise
         finally:
             async with self._lock:
                 self._stopping.pop(conversation_id, None)
