@@ -22,6 +22,7 @@ from openhands.sdk.context.prompts.sections.dynamic import (
     DateTimeSection,
     MemoryContextSection,
     RepoContextSection,
+    SecurityRiskEscalationSection,
 )
 from openhands.sdk.context.prompts.sections.planning import PlanningSection
 from openhands.sdk.context.prompts.sections.static import (
@@ -84,6 +85,7 @@ _DYNAMIC_SECTIONS: Final[tuple[PromptSection, ...]] = (
     MemoryContextSection(),  # guard: resolved memory present
     AvailableSkillsSection(),  # guard: available_skills_prompt
     CustomSuffixSection(),  # guard: system_message_suffix
+    SecurityRiskEscalationSection(),  # guard: llm_security_analyzer & custom prompt
     CustomSecretsSection(),  # guard: secret_infos present
     # DateTimeSection is intentionally last: it is the only per-conversation
     # volatile value, so the stable dynamic content stays a cache-friendly prefix.
