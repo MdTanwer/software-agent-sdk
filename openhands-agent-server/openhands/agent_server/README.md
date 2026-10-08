@@ -443,11 +443,8 @@ When the agent server is configured with `OH_CONVERSATION_RUNTIME=docker`, each 
 
 1. **On-Demand Provisioning**: Containers are not pre-warmed for every conversation in storage. Instead, `DockerConversationRegistry.get_or_create()` starts a container on-demand when the conversation is first created or accessed by an incoming request.
 2. **Active Lease Tracking**: When an HTTP request is received (such as sending a message, updating settings, or proxying workspace files) or a WebSocket subscriber connects, an active lease is acquired on the runtime. As long as any request is actively streaming or any socket is connected, the container is never suspended.
-3. **Idle Detection**: A background task periodically evaluates running containers against `OH_CONVERSATION_IDLE_TTL_SECONDS`. It queries the inner container's `/api/conversations/{id}/suspend-check` endpoint to verify that:
-   - The conversation is in a terminal state (`finished`, `error`, `stuck`).
-   - No agent run or goal loop is in progress.
-   - No external WebSocket subscribers or active request leases exist.
-4. **Atomic Suspension**: If the container is verified idle, its snapshot token is validated under lock, and the container is stopped via `docker stop`. If a request arrives during the probe, the suspension is aborted atomically and the container continues serving traffic.
+3. **Idle Detection**: A background task periodically checks running containers against `OH_CONVERSATION_IDLE_TTL_SECONDS`. It stops a container only when the persisted execution status is terminal (`finished`, `error`, or `stuck`), the idle TTL has elapsed, and no request lease or attached WebSocket session is held. Conversations that are `running`, `idle`, `paused`, or `waiting_for_confirmation` keep their containers.
+4. **Stop coordination**: Before `docker stop`, the registry re-checks the lease, the attached session, the idle deadline, and the lease generation under its lock. A request that arrives while the status is being read keeps the container. If `docker stop` fails, the container stays tracked and the next access reuses it.
 5. **Transparent Resume**: When an interaction occurs on a suspended conversation, `get_or_create()` recreates the container, mounts the existing workspace and persistence data, and resumes seamlessly.
 
 ### Runtime Suspension vs. Conversation Deletion

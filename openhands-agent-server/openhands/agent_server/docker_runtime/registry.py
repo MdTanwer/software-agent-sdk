@@ -16,8 +16,6 @@ from urllib.error import URLError
 from urllib.request import urlopen
 from uuid import UUID, uuid4
 
-import httpx
-
 from openhands.agent_server.config import V1_SESSION_API_KEY_ENV, Config
 from openhands.agent_server.conversation_registry import ConversationRegistry
 from openhands.agent_server.docker_runtime.provisioning import RuntimeProvisioningStore
@@ -29,7 +27,6 @@ from openhands.agent_server.models import (
 )
 from openhands.agent_server.persistence.store import _get_persistence_dir
 from openhands.agent_server.storage import Reclaimer
-from openhands.sdk.conversation.state import ConversationExecutionStatus
 from openhands.sdk.logger import get_logger
 from openhands.sdk.utils.cipher import Cipher
 from openhands.sdk.utils.command import execute_command, sanitized_env
@@ -406,11 +403,28 @@ class DockerConversationRegistry(ConversationRegistry):
     async def stop(self, conversation_id: UUID) -> None:
         await self._stop(conversation_id)
 
-    async def stop_if_idle(self, conversation_id: UUID, token: int) -> bool:
-        return await self._stop(conversation_id, if_idle_token=token)
+    async def stop_if_idle(
+        self,
+        conversation_id: UUID,
+        token: int,
+        *,
+        idle_before: float | None = None,
+        container: ConversationContainer | None = None,
+    ) -> bool:
+        return await self._stop(
+            conversation_id,
+            if_idle_token=token,
+            idle_before=idle_before,
+            expected_container=container,
+        )
 
     async def _stop(
-        self, conversation_id: UUID, *, if_idle_token: int | None = None
+        self,
+        conversation_id: UUID,
+        *,
+        if_idle_token: int | None = None,
+        idle_before: float | None = None,
+        expected_container: ConversationContainer | None = None,
     ) -> bool:
         task: asyncio.Task[ConversationContainer] | None = None
         container: ConversationContainer | None = None
@@ -423,6 +437,16 @@ class DockerConversationRegistry(ConversationRegistry):
                     or self.has_attached_sessions(conversation_id)
                     or self._lease_generations.get(conversation_id, 0) != if_idle_token
                     or self._containers.get(conversation_id) is None
+                    or (
+                        expected_container is not None
+                        and self._containers.get(conversation_id)
+                        is not expected_container
+                    )
+                    or (
+                        idle_before is not None
+                        and self._last_access.get(conversation_id, float("inf"))
+                        > idle_before
+                    )
                 ):
                     return False
 
@@ -438,7 +462,8 @@ class DockerConversationRegistry(ConversationRegistry):
 
         if wait_for_stop:
             await stop_event.wait()
-            return True
+            async with self._lock:
+                return conversation_id not in self._containers
 
         try:
             if task is not None:
@@ -492,11 +517,11 @@ class DockerConversationRegistry(ConversationRegistry):
             await asyncio.sleep(interval)
             try:
                 await self._evict_idle_runtimes(ttl)
-                await self._suspend_idle_containers(ttl)
             except Exception:
                 logger.exception("error_evicting_idle_docker_runtimes")
 
     async def _evict_idle_runtimes(self, ttl_seconds: float) -> None:
+        """Stop containers whose persisted conversation is terminal and idle."""
         service = self._service
         if service is None:
             return
@@ -506,151 +531,51 @@ class DockerConversationRegistry(ConversationRegistry):
                 (conversation_id, container)
                 for conversation_id, container in self._containers.items()
                 if self._last_access.get(conversation_id, float("inf")) <= cutoff
+                and conversation_id not in self._deleting
                 and conversation_id not in self._stopping
                 and not self.has_attached_sessions(conversation_id)
                 and not self.has_active_leases(conversation_id)
             ]
 
         for conversation_id, container in candidates:
-            info = await service.get_conversation(conversation_id)
-            if (
-                info is None
-                or info.execution_status == ConversationExecutionStatus.RUNNING
-            ):
-                continue
             async with self._lock:
-                if self._containers.get(conversation_id) is not container:
-                    continue
-                if self._last_access.get(conversation_id, float("inf")) > cutoff:
-                    continue
                 if (
-                    conversation_id in self._stopping
-                    or self.has_attached_sessions(conversation_id)
+                    conversation_id in self._deleting
+                    or conversation_id in self._stopping
+                    or self._containers.get(conversation_id) is not container
                     or self.has_active_leases(conversation_id)
+                    or self.has_attached_sessions(conversation_id)
+                    or self._last_access.get(conversation_id, float("inf")) > cutoff
                 ):
                     continue
-                self._containers.pop(conversation_id)
-                self._last_access.pop(conversation_id, None)
+                token = self._lease_generations.get(conversation_id, 0)
+
+            info = await service.get_conversation(conversation_id)
+            if info is None or not info.execution_status.is_terminal():
+                continue
+
             try:
-                await asyncio.to_thread(container.stop)
+                stopped = await self.stop_if_idle(
+                    conversation_id,
+                    token,
+                    idle_before=cutoff,
+                    container=container,
+                )
             except Exception:
-                async with self._lock:
-                    if conversation_id not in self._containers:
-                        self._containers[conversation_id] = container
-                        self._last_access[conversation_id] = time.monotonic()
                 logger.warning(
                     "Failed to stop idle conversation runtime %s",
                     conversation_id,
                     exc_info=True,
                 )
-            else:
-                logger.info(
-                    "Stopped idle conversation runtime %s (idle >= %.0fs)",
-                    conversation_id,
-                    ttl_seconds,
-                )
-                await service.refresh_persisted_conversation(conversation_id)
-                await self.reclaimer.on_stop(conversation_id)
-
-    async def _suspend_idle_containers(self, ttl: float | None = None) -> None:
-        """Check running containers and stop those that are idle and terminal."""
-        cutoff = time.monotonic() - ttl if ttl is not None else None
-        async with self._lock:
-            candidates = list(self._containers.items())
-
-        for conversation_id, container in candidates:
-            async with self._lock:
-                if (
-                    conversation_id in self._deleting
-                    or conversation_id in self._stopping
-                    or self._containers.get(conversation_id) is not container
-                    or self.has_active_leases(conversation_id)
-                    or self.has_attached_sessions(conversation_id)
-                ):
-                    continue
-                if (
-                    cutoff is not None
-                    and self._last_access.get(conversation_id, float("inf")) > cutoff
-                ):
-                    continue
-                token = self._lease_generations.get(conversation_id, 0)
-
-            try:
-                suspendable = await self._is_suspendable(conversation_id, container)
-            except Exception:
-                logger.debug(
-                    "Could not check suspend status for %s",
-                    conversation_id,
-                    exc_info=True,
-                )
                 continue
-
-            if not suspendable:
+            if not stopped:
                 continue
-
-            async with self._lock:
-                if (
-                    conversation_id in self._deleting
-                    or conversation_id in self._stopping
-                    or self._containers.get(conversation_id) is not container
-                    or self.has_active_leases(conversation_id)
-                    or self.has_attached_sessions(conversation_id)
-                    or self._lease_generations.get(conversation_id, 0) != token
-                ):
-                    logger.info(
-                        "Conversation %s was re-engaged or active during "
-                        "suspend check, skipping suspension",
-                        conversation_id,
-                    )
-                    continue
-
-            try:
-                stopped = await self.stop_if_idle(conversation_id, token)
-
-                if stopped:
-                    logger.info(
-                        "Suspended idle container for conversation %s",
-                        conversation_id,
-                    )
-                else:
-                    logger.info(
-                        "Conversation %s was re-engaged or active during "
-                        "suspend check, skipping suspension",
-                        conversation_id,
-                    )
-            except Exception:
-                logger.warning(
-                    "Failed to suspend container for %s",
-                    conversation_id,
-                    exc_info=True,
-                )
-
-    async def _is_suspendable(
-        self, conversation_id: UUID, container: ConversationContainer
-    ) -> bool:
-        """Query the inner agent-server to decide if the container is idle.
-
-        Returns ``True`` when the inner conversation is in a terminal
-        execution state (finished / error / stuck) **and** reports no
-        external WebSocket subscribers or active runs.
-        """
-        try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
-            ) as client:
-                resp = await client.get(
-                    f"{container.host}/api/conversations/{conversation_id}/suspend-check",
-                    headers={"X-Session-API-Key": container.api_key},
-                )
-        except httpx.HTTPError:
-            return False
-        if resp.status_code == 404 or resp.is_error:
-            return False
-        try:
-            data = resp.json()
-            return bool(data.get("suspendable", False))
-        except (ValueError, KeyError, TypeError):
-            return False
+            logger.info(
+                "Stopped idle conversation runtime %s (idle >= %.0fs)",
+                conversation_id,
+                ttl_seconds,
+            )
+            await service.refresh_persisted_conversation(conversation_id)
 
     def _build_container(self, conversation_id: UUID) -> ConversationContainer:
         identity = self.provisioning.load(conversation_id)
