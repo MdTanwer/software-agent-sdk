@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any, Protocol, cast, runtime_checkable
+
 from litellm.exceptions import (
     APIConnectionError,
     BadRequestError,
@@ -25,8 +27,41 @@ from .types import (
     LLMRateLimitError,
     LLMServiceUnavailableError,
     LLMTimeoutError,
-    SupportsMaxRetries,
+    SupportsRetryMetadata,
 )
+
+
+@runtime_checkable
+class _SupportsAttachedRetry(Protocol):
+    """Provider exception carrying SDK retry metadata.
+
+    ``sdk_max_retries`` is a separate attribute because LiteLLM prints its own
+    ``max_retries`` field in the exception string.
+    """
+
+    retry_attempt: int | None
+    sdk_max_retries: int | None
+
+
+def attach_exhausted_retry_metadata(
+    exc: BaseException, attempt: int, limit: int
+) -> None:
+    """Record the attempt that exhausted retries on the exception callers get.
+
+    Tenacity's ``before_sleep`` does not run after the final attempt, and
+    LiteLLM raises a new exception each attempt, so this has to stamp the
+    exception that is actually re-raised.
+    """
+    if isinstance(exc, LLMError):
+        exc.retry_attempt = attempt
+        exc.max_retries = limit
+        return
+    try:
+        attached = cast(Any, exc)
+        attached.retry_attempt = attempt
+        attached.sdk_max_retries = limit
+    except (AttributeError, TypeError):
+        return
 
 
 def map_provider_exception(exception: Exception) -> Exception:
@@ -67,9 +102,16 @@ def map_provider_exception(exception: Exception) -> Exception:
         return exception
 
     if isinstance(mapped, LLMError):
-        if mapped.retry_attempt is None and hasattr(exception, "retry_attempt"):
-            mapped.retry_attempt = exception.retry_attempt  # type: ignore[attr-defined]
-        if mapped.max_retries is None and isinstance(exception, SupportsMaxRetries):
-            mapped.max_retries = exception.max_retries
+        # Attached metadata wins: a LiteLLM exception also satisfies
+        # SupportsRetryMetadata once retry_attempt is set, but its own
+        # max_retries field is not the SDK limit.
+        if isinstance(exception, _SupportsAttachedRetry):
+            mapped.retry_attempt = exception.retry_attempt
+            mapped.max_retries = exception.sdk_max_retries
+        elif isinstance(exception, SupportsRetryMetadata):
+            if mapped.retry_attempt is None:
+                mapped.retry_attempt = exception.retry_attempt
+            if mapped.max_retries is None:
+                mapped.max_retries = exception.max_retries
 
     return mapped

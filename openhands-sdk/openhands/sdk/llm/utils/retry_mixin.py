@@ -15,6 +15,7 @@ from openhands.sdk.llm.exceptions import (
     SupportsMaxRetries,
     SupportsRetryMetadata,
 )
+from openhands.sdk.llm.exceptions.mapping import attach_exhausted_retry_metadata
 from openhands.sdk.logger import get_logger
 
 
@@ -164,6 +165,20 @@ class RetryMixin:
         """
         before_sleep = self._build_before_sleep(num_retries, retry_listener)
 
+        def on_exhausted(retry_state: RetryCallState) -> Any:
+            # Tenacity skips reraise when this callback is set, and before_sleep
+            # does not run for the final attempt. Stamp that attempt, then
+            # re-raise the original exception.
+            outcome = retry_state.outcome
+            exc = outcome.exception() if outcome is not None else None
+            if exc is not None:
+                attach_exhausted_retry_metadata(
+                    exc, retry_state.attempt_number, num_retries
+                )
+            if outcome is not None:
+                return outcome.result()
+            return None
+
         retry_condition = (
             retry_if_exception_type(retry_exceptions)
             if isinstance(retry_exceptions, tuple)
@@ -172,6 +187,7 @@ class RetryMixin:
 
         retry_decorator: Callable[[Callable[..., Any]], Callable[..., Any]] = retry(
             before_sleep=before_sleep,
+            retry_error_callback=on_exhausted,
             stop=stop_after_attempt(num_retries),
             reraise=True,
             retry=retry_condition,
