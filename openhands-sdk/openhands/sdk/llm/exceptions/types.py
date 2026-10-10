@@ -40,64 +40,36 @@ class LLMError(Exception):
 
 # General response parsing/validation errors
 class LLMMalformedActionError(LLMError):
-    def __init__(
-        self,
-        message: str = "Malformed response",
-        retry_attempt: int | None = None,
-        max_retries: int | None = None,
-    ) -> None:
-        super().__init__(message, retry_attempt=retry_attempt, max_retries=max_retries)
+    def __init__(self, message: str = "Malformed response") -> None:
+        super().__init__(message)
 
 
 class LLMNoActionError(LLMError):
-    def __init__(
-        self,
-        message: str = "Agent must return an action",
-        retry_attempt: int | None = None,
-        max_retries: int | None = None,
-    ) -> None:
-        super().__init__(message, retry_attempt=retry_attempt, max_retries=max_retries)
+    def __init__(self, message: str = "Agent must return an action") -> None:
+        super().__init__(message)
 
 
 class LLMResponseError(LLMError):
     def __init__(
-        self,
-        message: str = "Failed to retrieve action from LLM response",
-        retry_attempt: int | None = None,
-        max_retries: int | None = None,
+        self, message: str = "Failed to retrieve action from LLM response"
     ) -> None:
-        super().__init__(message, retry_attempt=retry_attempt, max_retries=max_retries)
+        super().__init__(message)
 
 
 # Function-calling conversion/validation
 class FunctionCallConversionError(LLMError):
-    def __init__(
-        self,
-        message: str,
-        retry_attempt: int | None = None,
-        max_retries: int | None = None,
-    ) -> None:
-        super().__init__(message, retry_attempt=retry_attempt, max_retries=max_retries)
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
 
 
 class FunctionCallValidationError(LLMError):
-    def __init__(
-        self,
-        message: str,
-        retry_attempt: int | None = None,
-        max_retries: int | None = None,
-    ) -> None:
-        super().__init__(message, retry_attempt=retry_attempt, max_retries=max_retries)
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
 
 
 class FunctionCallNotExistsError(LLMError):
-    def __init__(
-        self,
-        message: str,
-        retry_attempt: int | None = None,
-        max_retries: int | None = None,
-    ) -> None:
-        super().__init__(message, retry_attempt=retry_attempt, max_retries=max_retries)
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
 
 
 # Provider/transport related
@@ -107,10 +79,8 @@ class LLMNoResponseError(LLMError):
         message: str = (
             "LLM did not return a response. This is only seen in Gemini models so far."
         ),
-        retry_attempt: int | None = None,
-        max_retries: int | None = None,
     ) -> None:
-        super().__init__(message, retry_attempt=retry_attempt, max_retries=max_retries)
+        super().__init__(message)
 
 
 class LLMContextWindowExceedError(LLMError):
@@ -120,10 +90,8 @@ class LLMContextWindowExceedError(LLMError):
             "Conversation history longer than LLM context window limit. "
             "Consider enabling a condenser or shortening inputs."
         ),
-        retry_attempt: int | None = None,
-        max_retries: int | None = None,
     ) -> None:
-        super().__init__(message, retry_attempt=retry_attempt, max_retries=max_retries)
+        super().__init__(message)
 
 
 class LLMMalformedConversationHistoryError(LLMError):
@@ -134,10 +102,8 @@ class LLMMalformedConversationHistoryError(LLMError):
             "Consider retrying with condensed history and investigating the "
             "event stream."
         ),
-        retry_attempt: int | None = None,
-        max_retries: int | None = None,
     ) -> None:
-        super().__init__(message, retry_attempt=retry_attempt, max_retries=max_retries)
+        super().__init__(message)
 
 
 class LLMContextWindowTooSmallError(LLMError):
@@ -148,8 +114,6 @@ class LLMContextWindowTooSmallError(LLMError):
         context_window: int,
         min_required: int = 16384,
         message: str | None = None,
-        retry_attempt: int | None = None,
-        max_retries: int | None = None,
     ) -> None:
         if message is None:
             message = (
@@ -166,59 +130,34 @@ class LLMContextWindowTooSmallError(LLMError):
                 "variable:\n"
                 "  ALLOW_SHORT_CONTEXT_WINDOWS=true"
             )
-        super().__init__(message, retry_attempt=retry_attempt, max_retries=max_retries)
+        super().__init__(message)
         self.context_window = context_window
         self.min_required = min_required
 
 
 class LLMAuthenticationError(LLMError):
-    def __init__(
-        self,
-        message: str = "Invalid or missing API credentials",
-        retry_attempt: int | None = None,
-        max_retries: int | None = None,
-    ) -> None:
-        super().__init__(message, retry_attempt=retry_attempt, max_retries=max_retries)
+    def __init__(self, message: str = "Invalid or missing API credentials") -> None:
+        super().__init__(message)
 
 
 class LLMRateLimitError(LLMError):
-    def __init__(
-        self,
-        message: str = "Rate limit exceeded",
-        retry_attempt: int | None = None,
-        max_retries: int | None = None,
-    ) -> None:
-        super().__init__(message, retry_attempt=retry_attempt, max_retries=max_retries)
+    def __init__(self, message: str = "Rate limit exceeded") -> None:
+        super().__init__(message)
 
 
 class LLMTimeoutError(LLMError):
-    def __init__(
-        self,
-        message: str = "LLM request timed out",
-        retry_attempt: int | None = None,
-        max_retries: int | None = None,
-    ) -> None:
-        super().__init__(message, retry_attempt=retry_attempt, max_retries=max_retries)
+    def __init__(self, message: str = "LLM request timed out") -> None:
+        super().__init__(message)
 
 
 class LLMServiceUnavailableError(LLMError):
-    def __init__(
-        self,
-        message: str = "LLM service unavailable",
-        retry_attempt: int | None = None,
-        max_retries: int | None = None,
-    ) -> None:
-        super().__init__(message, retry_attempt=retry_attempt, max_retries=max_retries)
+    def __init__(self, message: str = "LLM service unavailable") -> None:
+        super().__init__(message)
 
 
 class LLMBadRequestError(LLMError):
-    def __init__(
-        self,
-        message: str = "Bad request to LLM provider",
-        retry_attempt: int | None = None,
-        max_retries: int | None = None,
-    ) -> None:
-        super().__init__(message, retry_attempt=retry_attempt, max_retries=max_retries)
+    def __init__(self, message: str = "Bad request to LLM provider") -> None:
+        super().__init__(message)
 
 
 class LLMContentPolicyViolationError(LLMBadRequestError):
@@ -230,12 +169,9 @@ class LLMContentPolicyViolationError(LLMBadRequestError):
     """
 
     def __init__(
-        self,
-        message: str = "Output blocked by content filtering policy",
-        retry_attempt: int | None = None,
-        max_retries: int | None = None,
+        self, message: str = "Output blocked by content filtering policy"
     ) -> None:
-        super().__init__(message, retry_attempt=retry_attempt, max_retries=max_retries)
+        super().__init__(message)
 
 
 # Other
