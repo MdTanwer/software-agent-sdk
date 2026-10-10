@@ -240,6 +240,11 @@
         "hash": "d4ddba252ea12924b2dd05cb4fb5ebcbf7b22685fc0a9b6ce305015b9cdd81d0"
     },
     {
+        "file": "openhands-sdk/openhands/sdk/llm/router/base.py",
+        "name": "getattr",
+        "hash": "09cb8fcdbf2f2742d279d873b054ece03eb4d8362f0dffe5c58f34e22c45fb66"
+    },
+    {
         "file": "openhands-sdk/openhands/sdk/marketplace/__init__.py",
         "name": "getattr",
         "hash": "9aa4828d48dae647719893510d2619568cbda8ac9f10643d4f3471a3a9fa07b1"

@@ -293,29 +293,16 @@ class RouterLLM(LLM):
         """
 
     def __getattr__(self, name: str) -> Any:
-        """Narrow compatibility boundary: delegate unhandled attributes to fallback LLM.
+        """Compatibility boundary: delegate unresolved attributes to fallback_llm.
 
-        This boundary exists for backwards compatibility with dynamic attribute
-        access on router instances. Direct capability access should prefer the
-        typed LLM interface methods.
+        LLM private state such as ``_metrics`` and ``_telemetry`` is delegated
+        too, so cost tracking, telemetry and model-feature checks reflect a
+        configured model rather than the router's placeholder model.
         """
-        try:
+        if name.startswith("__"):
             return super().__getattr__(name)  # pyright: ignore[reportAttributeAccessIssue]
-        except AttributeError:
-            pass
-
-        if name.startswith("_"):
-            raise AttributeError(
-                f"'{self.__class__.__name__}' object has no attribute '{name}'"
-            )
-        fallback = self.fallback_llm
-        logger.info(f"RouterLLM: delegating attribute '{name}' to fallback LLM")
-        try:
-            return fallback.__getattribute__(name)
-        except AttributeError:
-            if hasattr(type(fallback), "__getattr__"):
-                return type(fallback).__getattr__(fallback, name)  # pyright: ignore[reportAttributeAccessIssue]
-            raise
+        fallback_llm = self.fallback_llm
+        return getattr(fallback_llm, name)
 
     def __str__(self) -> str:
         """String representation of the router."""

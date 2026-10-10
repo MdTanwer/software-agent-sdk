@@ -158,6 +158,30 @@ def test_router_limits_stay_on_first_llm_after_routing():
     assert router.vision_is_active() == primary_llm.vision_is_active()
 
 
+@pytest.mark.parametrize(
+    "primary_model, check",
+    [
+        ("anthropic/claude-sonnet-4-5", LLM.is_caching_prompt_active),
+        ("gpt-5", LLM.uses_responses_api),
+    ],
+)
+def test_router_state_and_features_come_from_first_llm(primary_model, check):
+    primary_llm = LLM(
+        model=primary_model, api_key=SecretStr("key-1"), usage_id="primary-llm"
+    )
+    secondary_llm = LLM(
+        model="gpt-4o-mini", api_key=SecretStr("key-2"), usage_id="secondary-llm"
+    )
+    router = DummyRouter(
+        llms_for_routing={"primary": primary_llm, "secondary": secondary_llm}
+    )
+
+    assert router.metrics is primary_llm.metrics
+    assert router.telemetry is primary_llm.telemetry
+    assert check(primary_llm)
+    assert check(router)
+
+
 def test_router_without_llms_raises_instead_of_recursing():
     with pytest.raises(ValueError, match="no configured LLMs"):
         DummyRouter()
