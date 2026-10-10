@@ -7,6 +7,7 @@ from litellm import ModelResponse
 from pydantic import SecretStr
 
 from openhands.sdk.llm import LLM, LLMResponse, Message, RouterLLM, TextContent
+from openhands.sdk.llm.utils.runtime_metadata import ModelRuntimeMetadata
 
 
 class DummyRouter(RouterLLM):
@@ -270,27 +271,114 @@ def test_router_delegation_sync_and_async():
     c3 = async_resp.message.content[0]
     assert isinstance(c3, TextContent) and c3.text == "mock_aresponses"
 
-    # Sync generate
+    # generate/agenerate go through the router's own completion methods
     res_gen = router.generate(messages=msg)
     c4 = res_gen.message.content[0]
-    assert isinstance(c4, TextContent) and c4.text == "mock_generate"
+    assert isinstance(c4, TextContent) and c4.text == "mock_completion"
 
-    # Async agenerate
     async_gen = asyncio.run(router.agenerate(messages=msg))
     c5 = async_gen.message.content[0]
-    assert isinstance(c5, TextContent) and c5.text == "mock_agenerate"
+    assert isinstance(c5, TextContent) and c5.text == "mock_acompletion"
+
+
+def _text_response(text: str, llm: LLM) -> LLMResponse:
+    return LLMResponse(
+        message=Message(role="assistant", content=[TextContent(text=text)]),
+        metrics=llm.metrics.get_snapshot(),
+        raw_response=ModelResponse(id="mock-resp"),
+    )
+
+
+class InterceptRouter(DummyRouter):
+    def completion(self, *args: Any, **kwargs: Any) -> LLMResponse:
+        return _text_response("intercepted", self)
+
+    async def acompletion(self, *args: Any, **kwargs: Any) -> LLMResponse:
+        return _text_response("async-intercepted", self)
+
+
+def test_router_generate_calls_subclass_completion():
+    primary = LLM(model="gpt-4o", api_key=SecretStr("key"), usage_id="primary")
+    router = InterceptRouter(llms_for_routing={"primary": primary})
+    msg = [Message(role="user", content=[TextContent(text="hello")])]
+
+    sync = router.generate(messages=msg)
+    c0 = sync.message.content[0]
+    assert isinstance(c0, TextContent) and c0.text == "intercepted"
+
+    async_res = asyncio.run(router.agenerate(messages=msg))
+    c1 = async_res.message.content[0]
+    assert isinstance(c1, TextContent) and c1.text == "async-intercepted"
+
+
+def test_overlapping_calls_use_the_model_they_selected():
+    class RecordingLLM(MockLLM):
+        def completion(self, *args: Any, **kwargs: Any) -> LLMResponse:
+            self.calls.append(self.usage_id)
+            return super().completion(*args, **kwargs)
+
+        calls: ClassVar[list[str]] = []
+
+    class ByMessage(RouterLLM):
+        router_name: str = "by_message"
+
+        def select_llm(self, messages: list[Message]) -> str:
+            content = messages[0].content[0]
+            assert isinstance(content, TextContent)
+            return content.text
+
+    RecordingLLM.calls = []
+    primary = RecordingLLM(model="gpt-4o", api_key=SecretStr("k1"), usage_id="primary")
+    secondary = RecordingLLM(
+        model="gpt-4o-mini", api_key=SecretStr("k2"), usage_id="secondary"
+    )
+    router = ByMessage(llms_for_routing={"primary": primary, "secondary": secondary})
+    barrier = threading.Barrier(2)
+
+    def call(name: str) -> None:
+        barrier.wait(timeout=2)
+        router.completion(
+            messages=[Message(role="user", content=[TextContent(text=name)])]
+        )
+
+    threads = [
+        threading.Thread(target=call, args=(name,)) for name in ("primary", "secondary")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert RecordingLLM.calls.count("primary") == 1
+    assert RecordingLLM.calls.count("secondary") == 1
+
+
+class CountingLLM(LLM):
+    calls: int = 0
+
+    def resolve_runtime_metadata(
+        self, *, force: bool = False
+    ) -> ModelRuntimeMetadata | None:
+        self.calls += 1
+        return ModelRuntimeMetadata(source=self.model, max_input_tokens=111)
+
+    async def aresolve_runtime_metadata(
+        self, *, force: bool = False
+    ) -> ModelRuntimeMetadata | None:
+        self.calls += 1
+        return ModelRuntimeMetadata(source=self.model, max_input_tokens=222)
 
 
 def test_router_delegation_runtime_metadata_and_tokens():
-    """RouterLLM delegates metadata resolution and effective token limits."""
-    primary_llm = ExtendedLLM(
+    """Router resolves metadata for the first configured LLM only."""
+    primary_llm = CountingLLM(
         model="gpt-4o",
         api_key=SecretStr("key-1"),
         usage_id="primary-llm",
         max_input_tokens=32768,
         max_output_tokens=4096,
     )
-    secondary_llm = ExtendedLLM(
+    secondary_llm = CountingLLM(
         model="gpt-4o-mini",
         api_key=SecretStr("key-2"),
         usage_id="secondary-llm",
@@ -305,12 +393,19 @@ def test_router_delegation_runtime_metadata_and_tokens():
     assert router.effective_max_input_tokens == 32768
     assert router.effective_max_output_tokens == 4096
 
-    # Metadata resolution succeeds across routes
     res_sync = router.resolve_runtime_metadata()
-    assert res_sync is None or res_sync.max_input_tokens is not None
-
+    assert res_sync is not None and res_sync.source == "gpt-4o"
     res_async = asyncio.run(router.aresolve_runtime_metadata())
-    assert res_async is None or res_async.max_input_tokens is not None
+    assert res_async is not None and res_async.max_input_tokens == 222
+    assert primary_llm.calls == 2
+    assert secondary_llm.calls == 0
+
+    router.active_llm = secondary_llm
+    restored = DummyRouter.model_validate_json(router.model_dump_json())
+    first = next(iter(restored.llms_for_routing.values()))
+    assert restored.active_llm is not None
+    assert restored.fallback_llm is first
+    assert restored.fallback_llm is not restored.active_llm
 
 
 def test_router_unknown_model_selection_raises_key_error():

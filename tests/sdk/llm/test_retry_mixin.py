@@ -2,141 +2,84 @@ import asyncio
 from unittest.mock import MagicMock
 
 import pytest
-from litellm.exceptions import RateLimitError
-from tenacity import (
-    Future,
-    RetryCallState,
-    stop_after_attempt,
-    stop_after_delay,
-    stop_all,
-    stop_any,
-    stop_never,
-)
+from litellm.exceptions import APIConnectionError, RateLimitError
+from tenacity import Future, RetryCallState
 
 from openhands.sdk.llm.exceptions import (
     LLMNoResponseError,
     LLMRateLimitError,
     map_provider_exception,
 )
-from openhands.sdk.llm.utils.retry_mixin import (
-    RetryMixin,
-    SupportsStopCondition,
-    extract_max_retries,
-)
+from openhands.sdk.llm.utils.retry_mixin import RetryMixin
 
 
-def test_extract_max_retries_single_stop():
-    """extract_max_retries extracts limit from stop_after_attempt."""
-    stop = stop_after_attempt(5)
-    assert extract_max_retries(stop) == 5
-
-
-def test_extract_max_retries_compound_stops():
-    """extract_max_retries extracts limit from stop_any and stop_all."""
-    stop_any_condition = stop_any(stop_after_delay(10), stop_after_attempt(4))
-    assert extract_max_retries(stop_any_condition) == 4
-
-    stop_all_condition = stop_all(stop_after_attempt(7), stop_after_delay(30))
-    assert extract_max_retries(stop_all_condition) == 7
-
-
-def test_extract_max_retries_unbounded():
-    """extract_max_retries returns None for unbounded stop conditions."""
-    assert extract_max_retries(stop_never) is None
-    assert extract_max_retries(stop_after_delay(60)) is None
-    assert extract_max_retries(None) is None
-
-
-def test_extract_max_retries_custom_predicate():
-    """extract_max_retries supports custom stop predicate with max_attempts."""
-
-    class CustomStop:
-        max_attempts: int = 8
-
-    assert extract_max_retries(CustomStop()) == 8
+def _state(exc: BaseException, attempt: int) -> RetryCallState:
+    future = Future(attempt_number=attempt)
+    future.set_exception(exc)
+    state = RetryCallState(MagicMock(), fn=lambda: None, args=(), kwargs={})
+    state.attempt_number = attempt
+    state.outcome = future
+    return state
 
 
 def test_log_retry_attempt_bounded():
-    """log_retry_attempt attaches attempt and max_retries on bounded stop."""
-    mixin = RetryMixin()
+    """log_retry_attempt records the decorator's own attempt limit."""
     exc = LLMNoResponseError("timeout")
-
-    fake_future = Future(attempt_number=2)
-    fake_future.set_exception(exc)
-
-    mock_retry_obj = MagicMock()
-    mock_retry_obj.stop = stop_after_attempt(3)
-    assert isinstance(mock_retry_obj, SupportsStopCondition)
-
-    state = RetryCallState(mock_retry_obj, fn=lambda: None, args=(), kwargs={})
-    state.attempt_number = 2
-    state.outcome = fake_future
-
-    mixin.log_retry_attempt(state)
+    RetryMixin().log_retry_attempt(_state(exc, 2), num_retries=3)
     assert exc.retry_attempt == 2
     assert exc.max_retries == 3
 
 
-def test_log_retry_attempt_unbounded():
-    """log_retry_attempt attaches attempt number while max_retries remains None."""
-    mixin = RetryMixin()
+def test_log_retry_attempt_without_limit():
+    """log_retry_attempt leaves max_retries unset when no limit is passed."""
     exc = LLMNoResponseError("unbounded error")
-
-    fake_future = Future(attempt_number=5)
-    fake_future.set_exception(exc)
-
-    mock_retry_obj = MagicMock()
-    mock_retry_obj.stop = stop_never
-
-    state = RetryCallState(mock_retry_obj, fn=lambda: None, args=(), kwargs={})
-    state.attempt_number = 5
-    state.outcome = fake_future
-
-    mixin.log_retry_attempt(state)
+    RetryMixin().log_retry_attempt(_state(exc, 5))
     assert exc.retry_attempt == 5
     assert exc.max_retries is None
 
 
-def test_log_retry_attempt_litellm_exception():
-    """log_retry_attempt attaches attempt and max_retries to litellm exceptions."""
-    from litellm.exceptions import APIConnectionError
-
-    mixin = RetryMixin()
+def test_log_retry_attempt_does_not_rewrite_litellm_max_retries():
+    """retry_attempt is attached without changing the text LiteLLM prints."""
     exc = APIConnectionError("connection failed", "test_provider", "test_model")
-    assert not hasattr(exc, "retry_attempt")
-
-    fake_future = Future(attempt_number=2)
-    fake_future.set_exception(exc)
-
-    mock_retry_obj = MagicMock()
-    mock_retry_obj.stop = stop_after_attempt(3)
-
-    state = RetryCallState(mock_retry_obj, fn=lambda: None, args=(), kwargs={})
-    state.attempt_number = 2
-    state.outcome = fake_future
-
-    mixin.log_retry_attempt(state)
+    RetryMixin().log_retry_attempt(_state(exc, 2), num_retries=3)
     assert getattr(exc, "retry_attempt", None) == 2
-    assert exc.max_retries == 3
+    assert exc.max_retries is None
+    assert "LiteLLM Max Retries" not in str(exc)
 
 
-def test_log_retry_attempt_arbitrary_exception_safely_ignored():
-    """log_retry_attempt safely ignores exceptions not satisfying retry protocols."""
-    mixin = RetryMixin()
+def test_log_retry_attempt_sets_retry_attempt_on_custom_errors():
+    """Listeners can read retry_attempt on errors that have no max_retries."""
     exc = RuntimeError("generic error")
+    RetryMixin().log_retry_attempt(_state(exc, 1), num_retries=4)
+    assert getattr(exc, "retry_attempt", None) == 1
 
-    fake_future = Future(attempt_number=1)
-    fake_future.set_exception(exc)
 
-    mock_retry_obj = MagicMock()
-    mock_retry_obj.stop = stop_after_attempt(4)
+def test_custom_retry_listener_sees_retry_attempt():
+    class MyError(Exception):
+        pass
 
-    state = RetryCallState(mock_retry_obj, fn=lambda: None, args=(), kwargs={})
-    state.attempt_number = 1
-    state.outcome = fake_future
+    seen: list[int] = []
 
-    mixin.log_retry_attempt(state)
-    assert not hasattr(exc, "retry_attempt")
+    def listener(attempt: int, limit: int, exc: BaseException | None) -> None:
+        assert exc is not None
+        seen.append(getattr(exc, "retry_attempt"))
+
+    mixin = RetryMixin()
+
+    @mixin.retry_decorator(
+        num_retries=3,
+        retry_exceptions=(MyError,),
+        retry_min_wait=0,
+        retry_max_wait=0,
+        retry_listener=listener,
+    )
+    def flaky() -> None:
+        raise MyError("fail")
+
+    with pytest.raises(MyError):
+        flaky()
+
+    assert seen == [1, 2]
 
 
 def _exhausting(mixin: RetryMixin, exceptions: tuple[type[BaseException], ...]):

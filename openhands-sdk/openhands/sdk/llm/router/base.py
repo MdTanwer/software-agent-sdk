@@ -82,9 +82,10 @@ class RouterLLM(LLM):
                 f"Router '{self.router_name}' selected unknown LLM '{selected_model}'. "
                 f"Configured models: {list(self.llms_for_routing.keys())}"
             )
-        self.active_llm = self.llms_for_routing[selected_model]
+        chosen = self.llms_for_routing[selected_model]
+        self.active_llm = chosen
         logger.info(f"RouterLLM routing to {selected_model}...")
-        return self.active_llm
+        return chosen
 
     def completion(
         self,
@@ -188,54 +189,6 @@ class RouterLLM(LLM):
             **kwargs,
         )
 
-    def generate(
-        self,
-        messages: list[Message],
-        tools: Sequence[ToolDefinition] | None = None,
-        include: list[str] | None = None,
-        store: bool | None = None,
-        add_security_risk_prediction: bool = False,
-        on_token: TokenCallbackType | None = None,
-        call_context: LLMCallContext | None = None,
-        **kwargs,
-    ) -> LLMResponse:
-        """Generate response delegated to selected LLM."""
-        active_llm = self._select_and_activate(messages)
-        return active_llm.generate(
-            messages=messages,
-            tools=tools,
-            include=include,
-            store=store,
-            add_security_risk_prediction=add_security_risk_prediction,
-            on_token=on_token,
-            call_context=call_context,
-            **kwargs,
-        )
-
-    async def agenerate(
-        self,
-        messages: list[Message],
-        tools: Sequence[ToolDefinition] | None = None,
-        include: list[str] | None = None,
-        store: bool | None = None,
-        add_security_risk_prediction: bool = False,
-        on_token: AnyTokenCallbackType | None = None,
-        call_context: LLMCallContext | None = None,
-        **kwargs,
-    ) -> LLMResponse:
-        """Async variant of generate delegated to selected LLM."""
-        active_llm = await self._aselect_and_activate(messages)
-        return await active_llm.agenerate(
-            messages=messages,
-            tools=tools,
-            include=include,
-            store=store,
-            add_security_risk_prediction=add_security_risk_prediction,
-            on_token=on_token,
-            call_context=call_context,
-            **kwargs,
-        )
-
     def get_token_count(
         self,
         messages: list[Message],
@@ -266,26 +219,14 @@ class RouterLLM(LLM):
     def resolve_runtime_metadata(
         self, *, force: bool = False
     ) -> ModelRuntimeMetadata | None:
-        """Delegate runtime metadata resolution to configured LLMs."""
-        fallback = self.fallback_llm
-        fallback_meta: ModelRuntimeMetadata | None = None
-        for target_llm in self.llms_for_routing.values():
-            meta = target_llm.resolve_runtime_metadata(force=force)
-            if target_llm is fallback:
-                fallback_meta = meta
-        return fallback_meta
+        """Resolve runtime metadata for the first configured LLM only."""
+        return self.fallback_llm.resolve_runtime_metadata(force=force)
 
     async def aresolve_runtime_metadata(
         self, *, force: bool = False
     ) -> ModelRuntimeMetadata | None:
-        """Async delegate runtime metadata resolution to configured LLMs."""
-        fallback = self.fallback_llm
-        fallback_meta: ModelRuntimeMetadata | None = None
-        for target_llm in self.llms_for_routing.values():
-            meta = await target_llm.aresolve_runtime_metadata(force=force)
-            if target_llm is fallback:
-                fallback_meta = meta
-        return fallback_meta
+        """Async resolve runtime metadata for the first configured LLM only."""
+        return await self.fallback_llm.aresolve_runtime_metadata(force=force)
 
     @abstractmethod
     def select_llm(self, messages: list[Message]) -> str:

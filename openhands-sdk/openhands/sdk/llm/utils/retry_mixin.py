@@ -1,5 +1,5 @@
-from collections.abc import Callable, Iterable
-from typing import Any, Protocol, runtime_checkable
+from collections.abc import Callable
+from typing import Any, Protocol, cast, runtime_checkable
 
 from tenacity import (
     RetryCallState,
@@ -10,11 +10,7 @@ from tenacity import (
     wait_exponential,
 )
 
-from openhands.sdk.llm.exceptions import (
-    LLMNoResponseError,
-    SupportsMaxRetries,
-    SupportsRetryMetadata,
-)
+from openhands.sdk.llm.exceptions import LLMError, LLMNoResponseError
 from openhands.sdk.llm.exceptions.mapping import attach_exhausted_retry_metadata
 from openhands.sdk.logger import get_logger
 
@@ -32,60 +28,6 @@ class SupportsTemperature(Protocol):
     temperature: float | None
 
 
-@runtime_checkable
-class SupportsMaxAttemptNumber(Protocol):
-    """Protocol for tenacity stop predicates declaring max_attempt_number."""
-
-    max_attempt_number: int
-
-
-@runtime_checkable
-class SupportsMaxAttempts(Protocol):
-    """Protocol for stop predicates declaring max_attempts."""
-
-    max_attempts: int
-
-
-@runtime_checkable
-class SupportsCompoundStops(Protocol):
-    """Protocol for compound tenacity stop conditions (e.g. stop_any, stop_all)."""
-
-    stops: Iterable[Any]
-
-
-@runtime_checkable
-class SupportsStopCondition(Protocol):
-    """Protocol for tenacity retry objects declaring a stop condition."""
-
-    stop: Any
-
-
-def extract_max_retries(stop_condition: Any) -> int | None:
-    """Extract maximum attempt limit from a tenacity stop condition, if bounded.
-
-    Normalizes access across single stop conditions (e.g. ``stop_after_attempt``),
-    compound stop conditions (e.g. ``stop_any``, ``stop_all``), and custom stop
-    predicates. Returns ``None`` for unbounded retries (e.g. ``stop_never``).
-    """
-    if stop_condition is None:
-        return None
-
-    if isinstance(stop_condition, SupportsCompoundStops):
-        for stop_func in stop_condition.stops:
-            max_val = extract_max_retries(stop_func)
-            if max_val is not None:
-                return max_val
-        return None
-
-    if isinstance(stop_condition, SupportsMaxAttemptNumber):
-        return stop_condition.max_attempt_number
-
-    if isinstance(stop_condition, SupportsMaxAttempts):
-        return stop_condition.max_attempts
-
-    return None
-
-
 class RetryMixin:
     """Mixin class for retry logic."""
 
@@ -97,7 +39,7 @@ class RetryMixin:
         """Build a ``before_sleep`` callback shared by sync and async decorators."""
 
         def before_sleep(retry_state: RetryCallState) -> None:
-            self.log_retry_attempt(retry_state)
+            self.log_retry_attempt(retry_state, num_retries)
 
             if retry_listener is not None:
                 exc = (
@@ -199,7 +141,9 @@ class RetryMixin:
         )
         return retry_decorator
 
-    def log_retry_attempt(self, retry_state: RetryCallState) -> None:
+    def log_retry_attempt(
+        self, retry_state: RetryCallState, num_retries: int | None = None
+    ) -> None:
         """Log retry attempts."""
 
         if retry_state.outcome is None:
@@ -214,27 +158,15 @@ class RetryMixin:
             logger.error("retry_state.outcome.exception() returned None.")
             return
 
-        # Try to get max attempts from the stop condition if present
-        max_attempts: int | None = None
-        retry_obj = retry_state.retry_object
-        if isinstance(retry_obj, SupportsStopCondition):
-            max_attempts = extract_max_retries(retry_obj.stop)
-
-        # Attach typed fields for downstream consumers and listeners
-        if isinstance(exc, SupportsRetryMetadata):
-            exc.retry_attempt = retry_state.attempt_number
-            if max_attempts is not None:
-                exc.max_retries = max_attempts
-        elif isinstance(exc, SupportsMaxRetries):
-            # Third-party transport exceptions (e.g. litellm) declare max_retries
-            # but not retry_attempt; attach retry_attempt defensively so listeners
-            # and mapping receive it.
+        attempt = retry_state.attempt_number
+        if isinstance(exc, LLMError):
+            exc.retry_attempt = attempt
+            exc.max_retries = num_retries
+        else:
             try:
-                exc.retry_attempt = retry_state.attempt_number  # type: ignore[attr-defined]
+                cast(Any, exc).retry_attempt = attempt
             except (AttributeError, TypeError):
-                pass
-            if max_attempts is not None:
-                exc.max_retries = max_attempts
+                return
 
         logger.error(
             "%s. Attempt #%d | You can customize retry values in the configuration.",

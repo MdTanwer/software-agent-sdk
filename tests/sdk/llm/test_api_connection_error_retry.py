@@ -257,4 +257,5 @@ def test_retry_listener_callback(mock_litellm_completion, default_config):
         assert attempt >= 1
         assert max_attempts == default_config.num_retries
         assert getattr(err, "retry_attempt", None) == attempt
-        assert getattr(err, "max_retries", None) == max_attempts
+        assert getattr(err, "max_retries", None) is None
+        assert "LiteLLM Max Retries" not in str(err)
