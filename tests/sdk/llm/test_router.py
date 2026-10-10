@@ -1,5 +1,6 @@
 import asyncio
-from typing import Any
+import threading
+from typing import Any, ClassVar
 
 import pytest
 from litellm import ModelResponse
@@ -180,6 +181,33 @@ def test_router_state_and_features_come_from_first_llm(primary_model, check):
     assert router.telemetry is primary_llm.telemetry
     assert check(primary_llm)
     assert check(router)
+
+
+class ThreadRecordingRouter(RouterLLM):
+    router_name: str = "thread_recording_router"
+    select_threads: ClassVar[list[int]] = []
+
+    def select_llm(self, messages: list[Message]) -> str:
+        self.select_threads.append(threading.get_ident())
+        return "primary"
+
+
+def test_router_async_paths_select_llm_off_the_event_loop():
+    primary_llm = MockLLM(model="gpt-4o", api_key=SecretStr("key"), usage_id="p")
+    router = ThreadRecordingRouter(llms_for_routing={"primary": primary_llm})
+    msg = [Message(role="user", content=[TextContent(text="hello")])]
+
+    async def call_all() -> int:
+        await router.acompletion(messages=msg)
+        await router.aresponses(messages=msg)
+        await router.agenerate(messages=msg)
+        return threading.get_ident()
+
+    loop_thread = asyncio.run(call_all())
+
+    assert len(router.select_threads) == 3
+    assert loop_thread not in router.select_threads
+    assert router.active_llm is primary_llm
 
 
 def test_router_own_limits_and_disable_vision_win():

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from abc import abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
@@ -65,7 +66,17 @@ class RouterLLM(LLM):
 
     def _select_and_activate(self, messages: list[Message]) -> LLM:
         """Select, activate, and return the routed LLM for given messages."""
-        selected_model = self.select_llm(messages)
+        return self._activate(self.select_llm(messages))
+
+    async def _aselect_and_activate(self, messages: list[Message]) -> LLM:
+        """Async variant of _select_and_activate.
+
+        select_llm may count tokens over the whole history or fetch images, so
+        it runs in a worker thread to keep the event loop responsive.
+        """
+        return self._activate(await asyncio.to_thread(self.select_llm, messages))
+
+    def _activate(self, selected_model: str) -> LLM:
         if selected_model not in self.llms_for_routing:
             raise KeyError(
                 f"Router '{self.router_name}' selected unknown LLM '{selected_model}'. "
@@ -119,7 +130,7 @@ class RouterLLM(LLM):
         **kwargs,
     ) -> LLMResponse:
         """Async completion delegated to selected LLM."""
-        active_llm = self._select_and_activate(messages)
+        active_llm = await self._aselect_and_activate(messages)
         return await active_llm.acompletion(
             messages=messages,
             tools=tools,
@@ -165,7 +176,7 @@ class RouterLLM(LLM):
         **kwargs,
     ) -> LLMResponse:
         """Async responses call delegated to selected LLM."""
-        active_llm = self._select_and_activate(messages)
+        active_llm = await self._aselect_and_activate(messages)
         return await active_llm.aresponses(
             messages=messages,
             tools=tools,
@@ -213,7 +224,7 @@ class RouterLLM(LLM):
         **kwargs,
     ) -> LLMResponse:
         """Async variant of generate delegated to selected LLM."""
-        active_llm = self._select_and_activate(messages)
+        active_llm = await self._aselect_and_activate(messages)
         return await active_llm.agenerate(
             messages=messages,
             tools=tools,
