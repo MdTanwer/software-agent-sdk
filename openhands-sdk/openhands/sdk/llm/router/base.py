@@ -57,11 +57,10 @@ class RouterLLM(LLM):
 
     @property
     def fallback_llm(self) -> LLM:
-        """The currently active LLM, or the first configured LLM as fallback."""
-        if self.active_llm is not None:
-            return self.active_llm
+        """The first configured LLM, used for limits and capability queries."""
         if not self.llms_for_routing:
-            raise AttributeError("RouterLLM has no configured LLMs in llms_for_routing")
+            # Not AttributeError: that would re-enter __getattr__ and recurse.
+            raise ValueError("RouterLLM has no configured LLMs in llms_for_routing")
         return next(iter(self.llms_for_routing.values()))
 
     def _select_and_activate(self, messages: list[Message]) -> LLM:

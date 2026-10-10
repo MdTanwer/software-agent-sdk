@@ -132,6 +132,37 @@ class MockLLM(LLM):
         )
 
 
+class SecondaryRouter(RouterLLM):
+    router_name: str = "secondary_router"
+
+    def select_llm(self, messages: list[Message]) -> str:
+        return "secondary"
+
+
+def test_router_limits_stay_on_first_llm_after_routing():
+    primary_llm = MockLLM(
+        model="gpt-4o", api_key=SecretStr("key-1"), usage_id="primary-llm"
+    )
+    secondary_llm = MockLLM(
+        model="gpt-3.5-turbo", api_key=SecretStr("key-2"), usage_id="secondary-llm"
+    )
+    router = SecondaryRouter(
+        llms_for_routing={"primary": primary_llm, "secondary": secondary_llm}
+    )
+
+    router.completion(messages=[Message(role="user", content=[TextContent(text="hi")])])
+
+    assert router.active_llm is secondary_llm
+    assert router.effective_max_input_tokens == primary_llm.effective_max_input_tokens
+    assert router.effective_max_input_tokens != secondary_llm.effective_max_input_tokens
+    assert router.vision_is_active() == primary_llm.vision_is_active()
+
+
+def test_router_without_llms_raises_instead_of_recursing():
+    with pytest.raises(ValueError, match="no configured LLMs"):
+        DummyRouter()
+
+
 def test_router_delegation_sync_and_async():
     """RouterLLM delegates completion, responses, and generation (sync & async)."""
     primary_llm = MockLLM(
