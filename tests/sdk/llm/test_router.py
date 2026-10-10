@@ -182,6 +182,21 @@ def test_router_state_and_features_come_from_first_llm(primary_model, check):
     assert check(router)
 
 
+def test_router_own_limits_and_disable_vision_win():
+    primary_llm = LLM(model="gpt-4o", api_key=SecretStr("key-1"), usage_id="primary")
+    router = DummyRouter(
+        llms_for_routing={"primary": primary_llm},
+        max_input_tokens=20_000,
+        max_output_tokens=1_000,
+        disable_vision=True,
+    )
+
+    assert primary_llm.vision_is_active()
+    assert router.effective_max_input_tokens == 20_000
+    assert router.effective_max_output_tokens == 1_000
+    assert not router.vision_is_active()
+
+
 def test_router_without_llms_raises_instead_of_recursing():
     with pytest.raises(ValueError, match="no configured LLMs"):
         DummyRouter()

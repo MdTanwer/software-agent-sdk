@@ -239,18 +239,18 @@ class RouterLLM(LLM):
         )
 
     def vision_is_active(self) -> bool:
-        """Delegate vision capability check to fallback LLM."""
-        return self.fallback_llm.vision_is_active()
+        """Honor the router's disable_vision, then delegate to fallback LLM."""
+        return not self.disable_vision and self.fallback_llm.vision_is_active()
 
     @property
     def effective_max_input_tokens(self) -> int | None:
-        """Delegate effective max input tokens to fallback LLM."""
-        return self.fallback_llm.effective_max_input_tokens
+        """Router's max_input_tokens wins, else delegate to fallback LLM."""
+        return self.max_input_tokens or self.fallback_llm.effective_max_input_tokens
 
     @property
     def effective_max_output_tokens(self) -> int | None:
-        """Delegate effective max output tokens to fallback LLM."""
-        return self.fallback_llm.effective_max_output_tokens
+        """Router's max_output_tokens wins, else delegate to fallback LLM."""
+        return self.max_output_tokens or self.fallback_llm.effective_max_output_tokens
 
     def resolve_runtime_metadata(
         self, *, force: bool = False
