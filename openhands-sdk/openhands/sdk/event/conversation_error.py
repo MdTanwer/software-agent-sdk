@@ -48,12 +48,19 @@ class ConversationErrorEvent(Event):
         default=None,
         description=(
             "Stable key grouping the same module, function, and error code. "
-            "Derived without line numbers, messages, paths, or secrets."
+            "Derived from origin and code when omitted. A supplied 32-char "
+            "hex key is kept. Never built from line numbers or message text."
         ),
     )
 
     @model_validator(mode="after")
     def classify(self) -> "ConversationErrorEvent":
+        """Fill classification, and the grouping key when the caller omitted it.
+
+        ``code`` is a stable type, so a missing key is ``grouping_key_for``
+        of the sanitized origin and code. A caller-supplied hex key is kept.
+        ``AgentErrorEvent`` cannot do this: its message is not a stable code.
+        """
         if self.classification is None:
             object.__setattr__(
                 self, "classification", classify_error(self.code, self.detail)
@@ -61,13 +68,9 @@ class ConversationErrorEvent(Event):
         origin = validated_origin(self.origin)
         if origin != self.origin:
             object.__setattr__(self, "origin", origin)
-        # The event code is the stable type. Recompute so every producer
-        # groups the same way, and so a caller cannot store message text here.
-        key = (
-            grouping_key_for(origin, self.code)
-            if origin is not None
-            else validated_grouping_key(self.grouping_key)
-        )
+        key = validated_grouping_key(self.grouping_key)
+        if key is None and origin is not None:
+            key = grouping_key_for(origin, self.code)
         if key != self.grouping_key:
             object.__setattr__(self, "grouping_key", key)
         return self

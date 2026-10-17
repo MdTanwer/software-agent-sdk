@@ -24,6 +24,13 @@ Privacy and stability rules (this is the only place these fields are derived):
 * Identifiers match ``^[A-Za-z_][A-Za-z0-9_]*([.:][A-Za-z_][A-Za-z0-9_]*)*$``
   and are at most 96 characters. A function qualname containing ``<locals>``
   or ``<lambda>`` is rejected; the plain code name is used when that is safe.
+  An origin that still does not fit is omitted. It is not shortened to a
+  shared suffix: two modules can share that suffix and would then group as
+  one failure.
+* ``ConversationErrorEvent`` derives ``grouping_key`` from ``origin`` and
+  ``code`` when the caller does not supply a valid key. ``AgentErrorEvent``
+  does not: its ``error`` string is the message, so the producer passes the
+  digest of the exception class name and the model only checks the hex form.
 * OpenHands frames keep their full module path. Any other frame keeps only
   its top-level package, so an unfamiliar dependency cannot grow cardinality
   or leak a deep import path.
@@ -53,7 +60,8 @@ _SAFE_IDENTIFIER_RE: Final[re.Pattern[str]] = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_]*([.:][A-Za-z_][A-Za-z0-9_]*)*$"
 )
 _GROUPING_KEY_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{32}$")
-_MAX_TRACE_FRAMES: Final[int] = 256
+_MAX_YIELDED_FRAMES: Final[int] = 256
+_MAX_TRACE_LINKS: Final[int] = 2048
 
 
 def safe_identifier(value: object, *, default: str = UNKNOWN_ERROR_CLASS) -> str:
@@ -85,11 +93,19 @@ class TraceFrame:
 def iter_traceback_frames(tb: TracebackType | None) -> Iterator[TraceFrame]:
     """Walk a traceback without reading messages, locals, or source lines.
 
-    Bounded to 256 frames so a runaway recursion cannot grow the walk.
+    At most 256 frames are yielded. A link with no module name is skipped and
+    does not consume that budget, so a nameless frame cannot hide a later
+    OpenHands frame. The walk still stops after 2048 links.
     """
     current = tb
-    remaining = _MAX_TRACE_FRAMES
-    while current is not None and remaining > 0:
+    yielded = 0
+    links = 0
+    while (
+        current is not None
+        and yielded < _MAX_YIELDED_FRAMES
+        and links < _MAX_TRACE_LINKS
+    ):
+        links += 1
         module = current.tb_frame.f_globals.get("__name__")
         if isinstance(module, str) and module:
             code = current.tb_frame.f_code
@@ -99,8 +115,8 @@ def iter_traceback_frames(tb: TracebackType | None) -> Iterator[TraceFrame]:
                 name=code.co_name or None,
                 lineno=current.tb_lineno,
             )
+            yielded += 1
         current = current.tb_next
-        remaining -= 1
 
 
 def _is_first_party(module: str) -> bool:
@@ -126,12 +142,7 @@ def _join_origin(module: str, function: str | None) -> str | None:
     combined = f"{module_token}.{function}"
     if _accepted(combined) == combined:
         return combined
-    parts = module_token.split(".")
-    for start in range(1, len(parts)):
-        shortened = ".".join([*parts[start:], function])
-        if _accepted(shortened) == shortened:
-            return shortened
-    return _accepted(function)
+    return None
 
 
 def origin_from_exception(exc: BaseException) -> str | None:

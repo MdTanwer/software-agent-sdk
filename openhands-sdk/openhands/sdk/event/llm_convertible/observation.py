@@ -159,8 +159,9 @@ class AgentErrorEvent(ObservationBaseEvent):
     grouping_key: str | None = Field(
         default=None,
         description=(
-            "Stable key grouping the same module, function, and error code. "
-            "Derived without line numbers, messages, paths, or secrets."
+            "Stable key grouping the same module, function, and exception "
+            "class. Supplied by the producer. Not derived from the error "
+            "message. Omitted when no exception is available."
         ),
     )
 
@@ -175,7 +176,8 @@ class AgentErrorEvent(ObservationBaseEvent):
         default so telemetry treats them as diagnostics.
 
         ``error`` is the scaffold message and is never used to derive
-        ``origin`` or ``grouping_key``.
+        ``origin`` or ``grouping_key``. Unlike ``ConversationErrorEvent``,
+        this model has no stable ``code``, so a missing key stays missing.
         """
         if self.classification is None:
             object.__setattr__(

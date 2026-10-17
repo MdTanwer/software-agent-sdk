@@ -4,6 +4,7 @@ import re
 import subprocess
 import sys
 
+import openhands.sdk.event.error_origin as error_origin
 from openhands.sdk.event.conversation_error import ConversationErrorEvent
 from openhands.sdk.event.error_classification import (
     AGENT_OUTCOME,
@@ -116,6 +117,85 @@ def test_library_raise_is_attributed_to_the_openhands_caller() -> None:
     else:
         raise AssertionError("expected TypeError")
     assert origin == "openhands.sdk._origin_caller.caller"
+
+
+def _raise_in(module: str, function: str) -> BaseException:
+    namespace = {"__name__": module}
+    exec(f"def {function}():\n    raise TypeError('x')\n", namespace)
+    raiser = namespace[function]
+    assert callable(raiser)
+    try:
+        raiser()
+    except TypeError as exc:
+        return exc
+    raise AssertionError("expected TypeError")
+
+
+def test_overlong_origins_are_omitted_instead_of_sharing_a_suffix() -> None:
+    function = "run"
+    pad = "s" * 80
+    module_a = f"openhands.alpha.{pad}"
+    module_b = f"openhands.beta.{pad}"
+    assert len(module_a) <= 96
+    assert len(f"{module_a}.{function}") > 96
+
+    origin_a = origin_from_exception(_raise_in(module_a, function))
+    origin_b = origin_from_exception(_raise_in(module_b, function))
+
+    assert origin_a is None
+    assert origin_b is None
+
+
+def test_nameless_frames_do_not_hide_a_later_named_frame(monkeypatch) -> None:
+    monkeypatch.setattr(error_origin, "_MAX_YIELDED_FRAMES", 2)
+    hidden: dict[str, object] = {}
+    visible = {"__name__": "openhands.sdk._budget_visible"}
+    exec("def visible():\n    raise TypeError('x')\n", visible)
+    exec(
+        "def hidden():\n"
+        "    try:\n"
+        "        visible()\n"
+        "    except TypeError as exc:\n"
+        "        return exc\n",
+        hidden,
+    )
+    hidden["visible"] = visible["visible"]
+    raiser = hidden["hidden"]
+    assert callable(raiser)
+    exc = raiser()
+    assert isinstance(exc, TypeError)
+    modules = [
+        frame.module for frame in error_origin.iter_traceback_frames(exc.__traceback__)
+    ]
+    assert "openhands.sdk._budget_visible" in modules
+
+
+def test_conversation_error_keeps_a_supplied_grouping_key() -> None:
+    origin = "openhands.sdk.llm.llm.completion"
+    supplied = grouping_key_for(origin, "RuntimeError")
+    assert supplied is not None
+    event = ConversationErrorEvent(
+        source="environment",
+        code="TypeError",
+        detail="x",
+        origin=origin,
+        grouping_key=supplied,
+    )
+    assert event.grouping_key == supplied
+    assert event.grouping_key != grouping_key_for(origin, "TypeError")
+
+
+def test_agent_error_does_not_derive_a_key_from_the_message() -> None:
+    event = AgentErrorEvent(
+        error="TypeError: secret /tmp/hidden",
+        tool_name="bash",
+        tool_call_id="call-1",
+        origin="openhands.sdk.tool.tool.ToolDefinition.__call__",
+    )
+    assert event.origin == "openhands.sdk.tool.tool.ToolDefinition.__call__"
+    assert event.grouping_key is None
+    assert event.classification is not None
+    assert event.classification.kind == FailureKind.UNKNOWN
 
 
 def test_unraised_exception_has_no_origin() -> None:

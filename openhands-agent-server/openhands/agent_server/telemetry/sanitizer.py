@@ -36,6 +36,7 @@ from openhands.agent_server.telemetry.models import (
 )
 from openhands.sdk.event.error_origin import (
     FIRST_PARTY_ROOT as _FIRST_PARTY_ROOT,
+    UNKNOWN_ERROR_CLASS as UNKNOWN_ERROR_CLASS,
     iter_traceback_frames,
     safe_identifier,
 )
