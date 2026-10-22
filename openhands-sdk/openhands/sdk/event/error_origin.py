@@ -90,21 +90,22 @@ class TraceFrame:
     lineno: int
 
 
-def iter_traceback_frames(tb: TracebackType | None) -> Iterator[TraceFrame]:
+def iter_traceback_frames(
+    tb: TracebackType | None, *, max_links: int = _MAX_TRACE_LINKS
+) -> Iterator[TraceFrame]:
     """Walk a traceback without reading messages, locals, or source lines.
 
     At most 256 frames are yielded. A link with no module name is skipped and
     does not consume that budget, so a nameless frame cannot hide a later
-    OpenHands frame. The walk still stops after 2048 links.
+    OpenHands frame. The walk still stops after ``max_links`` links, including
+    links that are not yielded. The default cap is 2048, and a larger request
+    is clamped to that cap.
     """
     current = tb
     yielded = 0
     links = 0
-    while (
-        current is not None
-        and yielded < _MAX_YIELDED_FRAMES
-        and links < _MAX_TRACE_LINKS
-    ):
+    link_limit = min(max_links, _MAX_TRACE_LINKS)
+    while current is not None and yielded < _MAX_YIELDED_FRAMES and links < link_limit:
         links += 1
         module = current.tb_frame.f_globals.get("__name__")
         if isinstance(module, str) and module:

@@ -11,7 +11,9 @@ Two rules carry the privacy guarantee, and both are testable:
    :func:`openhands.sdk.event.error_origin.iter_traceback_frames`, which reads
    only the module name, the code object's name, and ``tb_lineno``. The
    fingerprint preimage still uses module and line, not the function name.
-   ``traceback.extract_tb`` / ``format_exception`` stay forbidden because
+   The fingerprint walk stops after 256 links, and a frame with no module
+   name still consumes one of those links. ``traceback.extract_tb`` /
+   ``format_exception`` stay forbidden because
    :class:`traceback.FrameSummary` reads the source line off disk, and
    ``f_locals`` holds live values.
 
@@ -43,6 +45,8 @@ from openhands.sdk.event.error_origin import (
 
 
 _MAX_FINGERPRINT_FRAMES: Final[int] = 5
+# Every traceback link counts, including a frame whose globals have no module name.
+_FINGERPRINT_TRACE_LINKS: Final[int] = 256
 
 _SAFE_TOKEN_RE: Final[re.Pattern[str]] = re.compile(r"^[a-z0-9][a-z0-9_.:\-]{0,63}$")
 _VERSION_RE: Final[re.Pattern[str]] = re.compile(
@@ -220,7 +224,7 @@ class ErrorFingerprint:
 
 def _walk_frames(tb: TracebackType | None) -> Iterator[tuple[str, int]]:
     """Collect ``(module, lineno)`` pairs without materialising source."""
-    for frame in iter_traceback_frames(tb):
+    for frame in iter_traceback_frames(tb, max_links=_FINGERPRINT_TRACE_LINKS):
         yield frame.module, frame.lineno
 
 

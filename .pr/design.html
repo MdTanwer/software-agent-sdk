@@ -174,7 +174,7 @@ AgentErrorEvent
       </div>
       <div class="card">
         <h3><code>normalize_exception</code> output stays the same</h3>
-        <p><code>_walk_frames</code> now yields <code>(module, lineno)</code> from the shared walker. The fingerprint preimage is still schema version, class, category, and <code>module:lineno</code>. Function names are read and then ignored by the fingerprint.</p>
+        <p><code>_walk_frames</code> yields <code>(module, lineno)</code> from the shared walker and stops that walk after 256 links. A nameless frame still consumes a link, which is the budget the fingerprint used before the shared walker. The preimage is still schema version, class, category, and <code>module:lineno</code>. Function names are read and then ignored. Event origins keep a separate rule: a nameless link does not consume their 256-frame yield budget.</p>
         <p><a class="src" href="https://github.com/MdTanwer/software-agent-sdk/blob/8de881b78a5321c80f5d0aad6898c0010e1959d9/openhands-agent-server/openhands/agent_server/telemetry/sanitizer.py#L218">sanitizer.py:218</a></p>
       </div>
     </section>
