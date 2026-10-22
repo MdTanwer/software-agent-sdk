@@ -2067,7 +2067,6 @@ def mock_acp_binary_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     import openhands.sdk.settings.model as model_mod
     from openhands.sdk.settings.acp_install_catalog import ACP_INSTALL_CATALOG
 
-    model_mod._probe_acp_binary_version.cache_clear()
     pinned_by_bin = {
         spec.binary_name: spec.packages[0].version
         for spec in ACP_INSTALL_CATALOG.values()
@@ -2250,6 +2249,109 @@ def test_acp_resolve_command_with_real_script_stale_version(
 
     settings = ACPAgentSettings(acp_server=server)
     assert settings.resolve_acp_command() == expected_npx
+
+
+def _image_acp_install(
+    root: Path,
+    *,
+    binary_name: str,
+    package_name: str,
+    version: str,
+    script: str,
+) -> tuple[Path, Path]:
+    """Lay out an agent-server wrapper and the npm tree it execs.
+
+    Returns ``(wrapper_dir, npm_bin_dir)``. ``npm_bin_dir`` holds the symlink
+    npm would put on PATH; ``wrapper_dir`` holds the shell wrapper the image
+    copies to ``/usr/local/bin``.
+    """
+    acp_node = root / "acp-node"
+    package_dir = acp_node / "lib" / "node_modules" / package_name
+    package_bin = package_dir / "bin"
+    package_bin.mkdir(parents=True)
+    (package_dir / "package.json").write_text(
+        json.dumps({"name": package_name, "version": version})
+    )
+    real_bin = package_bin / binary_name
+    real_bin.write_text(script)
+    real_bin.chmod(0o755)
+    npm_bin_dir = acp_node / "bin"
+    npm_bin_dir.mkdir()
+    npm_bin = npm_bin_dir / binary_name
+    npm_bin.symlink_to(real_bin)
+
+    wrapper_dir = root / "wrappers"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / binary_name
+    wrapper.write_text(
+        "#!/bin/sh\n" + f'PATH="{acp_node}/bin:$PATH" exec "{npm_bin}" "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    return wrapper_dir, npm_bin_dir
+
+
+@pytest.mark.parametrize(
+    "server",
+    ["claude-code", "codex", "gemini-cli", "kimi-code", "pi", "opencode"],
+)
+@pytest.mark.parametrize("layout", ["wrapper", "npm-bin"])
+def test_acp_resolve_command_reads_pinned_version_from_package_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    server: ACPServerKind,
+    layout: str,
+) -> None:
+    """Image wrappers and npm bins match the pin without running ``--version``.
+
+    The bin exits 0 with no output (what ``pi-acp --version`` does) and records
+    that it was executed. Resolution must still select it from package.json.
+    """
+    from openhands.sdk.settings.acp_install_catalog import ACP_INSTALL_CATALOG
+
+    spec = ACP_INSTALL_CATALOG[server]
+    marker = tmp_path / "invoked"
+    wrapper_dir, npm_bin_dir = _image_acp_install(
+        tmp_path,
+        binary_name=spec.binary_name,
+        package_name=spec.packages[0].name,
+        version=spec.packages[0].version,
+        script=f"#!/bin/sh\ntouch '{marker}'\nexit 0\n",
+    )
+    path_dir = wrapper_dir if layout == "wrapper" else npm_bin_dir
+    monkeypatch.setenv("PATH", f"{path_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    settings = ACPAgentSettings(acp_server=server)
+    assert settings.resolve_acp_command() == [
+        spec.binary_name,
+        *spec.trailing_args,
+    ]
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("layout", ["wrapper", "npm-bin"])
+def test_acp_resolve_command_keeps_npx_when_package_json_is_stale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+) -> None:
+    """A stale installed package is not used, even if ``--version`` would match."""
+    from openhands.sdk.settings.acp_install_catalog import ACP_INSTALL_CATALOG
+
+    spec = ACP_INSTALL_CATALOG["codex"]
+    marker = tmp_path / "invoked"
+    wrapper_dir, npm_bin_dir = _image_acp_install(
+        tmp_path,
+        binary_name=spec.binary_name,
+        package_name=spec.packages[0].name,
+        version="0.16.0",
+        script=f"#!/bin/sh\ntouch '{marker}'\necho '{spec.packages[0].version}'\n",
+    )
+    path_dir = wrapper_dir if layout == "wrapper" else npm_bin_dir
+    monkeypatch.setenv("PATH", f"{path_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    settings = ACPAgentSettings(acp_server="codex")
+    assert settings.resolve_acp_command() == list(spec.npx_command())
+    assert not marker.exists()
 
 
 def test_acp_resolve_command_with_real_script_unparseable_or_failing_version(

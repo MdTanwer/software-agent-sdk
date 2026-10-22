@@ -40,7 +40,6 @@ class ACPPackagePin:
 
 
 ACP_VERSION_RE = re.compile(r"v?(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)")
-_ACP_VERSION_RE = ACP_VERSION_RE
 
 
 @dataclass(frozen=True)

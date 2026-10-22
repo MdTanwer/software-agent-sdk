@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import copy
-import functools
 import itertools
+import json
+import re
 import shutil
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
@@ -1632,28 +1633,97 @@ class OpenHandsAgentSettings(AgentSettingsBase):
         )
 
 
-@functools.lru_cache(maxsize=32)
-def _probe_acp_binary_version(binary_path: str) -> str | None:
-    """Probe an executable for its version string via ``<binary> --version``.
+_ACP_CLI_VERSION_TIMEOUT_SECS = 10.0
+_ACP_WRAPPER_EXEC_RE = re.compile(
+    r'^#!/bin/sh\nPATH="[^"]+/bin:\$PATH" exec "([^"]+)" "\$@"\n?\Z'
+)
 
-    Returns the first semver string found in stdout/stderr, or ``None`` if the
-    command fails, times out, or produces unparseable output.
-    """
+
+def _wrapper_exec_target(path: Path) -> Path | None:
+    """Return the ``exec`` target of an agent-server ACP wrapper, if *path* is one."""
+    try:
+        if not path.is_file() or path.stat().st_size > 4096:
+            return None
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = _ACP_WRAPPER_EXEC_RE.fullmatch(text)
+    if match is None:
+        return None
+    target = Path(match.group(1))
+    return target if target.is_absolute() else None
+
+
+def _version_in_package_json(path: Path) -> str | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    version = payload.get("version")
+    if not isinstance(version, str) or not version:
+        return None
+    match = ACP_VERSION_RE.fullmatch(version)
+    return match.group(1) if match else version
+
+
+def _npm_package_version(binary: Path) -> str | None:
+    """Version of the npm package under ``node_modules`` that owns *binary*."""
+    try:
+        resolved = binary.resolve()
+    except OSError:
+        return None
+    if "node_modules" not in resolved.parts:
+        return None
+    for parent in resolved.parents:
+        if parent.name == "node_modules":
+            return None
+        package_json = parent / "package.json"
+        if package_json.is_file():
+            return _version_in_package_json(package_json)
+    return None
+
+
+def _installed_acp_package_version(binary_path: str) -> str | None:
+    path = Path(binary_path)
+    target = _wrapper_exec_target(path)
+    if target is not None:
+        path = target
+    return _npm_package_version(path)
+
+
+def _probe_acp_cli_version(binary_path: str) -> str | None:
+    """First semver from ``<binary> --version``, or ``None`` on failure or timeout."""
     try:
         proc = subprocess.run(
             [binary_path, "--version"],
             capture_output=True,
             text=True,
-            timeout=2.0,
+            timeout=_ACP_CLI_VERSION_TIMEOUT_SECS,
             check=False,
         )
-        if proc.returncode != 0:
-            return None
-        output = f"{proc.stdout}\n{proc.stderr}".strip()
-        match = ACP_VERSION_RE.search(output)
-        return match.group(1) if match else None
-    except Exception:
+    except (OSError, subprocess.TimeoutExpired):
         return None
+    if proc.returncode != 0:
+        return None
+    match = ACP_VERSION_RE.search(f"{proc.stdout}\n{proc.stderr}")
+    return match.group(1) if match else None
+
+
+def _probe_acp_binary_version(binary_path: str) -> str | None:
+    """Version of *binary_path*, from its npm ``package.json`` when that exists.
+
+    Agent-server wrappers and global npm bins point at an installed package.
+    Reading that ``package.json`` avoids spawning the CLI: ``pi-acp --version``
+    prints nothing, and several pinned CLIs take longer than a short timeout
+    to start. Other executables are probed with ``--version``. A miss is not
+    cached.
+    """
+    installed = _installed_acp_package_version(binary_path)
+    if installed is not None:
+        return installed
+    return _probe_acp_cli_version(binary_path)
 
 
 class ACPAgentSettings(AgentSettingsBase):
